@@ -28,6 +28,7 @@ import os
 import random
 import sys
 import time
+import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -82,6 +83,12 @@ class KalshiAPIError(KalshiError):
 def log(msg: str) -> None:
     stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%SZ")
     print(f"[{stamp}] {msg}", flush=True)
+
+
+def _clean(params: dict) -> dict | None:
+    """Drop unset query params. Query strings are never part of the signature."""
+    present = {key: value for key, value in params.items() if value is not None}
+    return present or None
 
 
 def mask(secret: str) -> str:
@@ -338,7 +345,6 @@ class KalshiClient:
         return self.request("DELETE", route, **kwargs)
 
     # --- endpoints -------------------------------------------------------
-    # Only what step 1 needs. Trading endpoints land with quoter.py/risk.py.
 
     def balance(self) -> dict:
         """GET /portfolio/balance -> {"balance": <cents>, ...}"""
@@ -347,6 +353,87 @@ class KalshiClient:
     def exchange_status(self) -> dict:
         """GET /exchange/status. Unsigned in practice, but harmless to sign."""
         return self.get("/exchange/status")
+
+    # The four risk.py calls. Do not call create_order from anywhere else:
+    # RiskManager is the gateway that enforces limits before an order is sent.
+
+    def create_order(self, ticker: str, side: str, count: int, price_cents: int,
+                     *, action: str = "buy", client_order_id: str | None = None,
+                     retry: bool = False) -> dict:
+        """
+        POST /portfolio/orders — a resting limit order.
+
+        `side` is "yes" or "no" and the price goes in the matching field;
+        `action` is "buy" or "sell". Both sides of a Kalshi market are bought,
+        which is why the quoter thinks in terms of yes/no rather than buy/sell.
+
+        retry=False by default, and that is a money decision, not an oversight.
+        A create_order that times out may or may not have reached the matching
+        engine, so replaying it can double the position. A client_order_id is
+        always sent, which is what would MAKE a retry safe — but Kalshi's
+        deduplication behaviour is not verified here, and a dropped quote costs
+        one requote cycle while a duplicate costs real money. Pass retry=True
+        only after confirming that dedup against a live account.
+        """
+        if side not in ("yes", "no"):
+            raise ValueError(f"side must be 'yes' or 'no', got {side!r}")
+        if count <= 0:
+            raise ValueError(f"count must be positive, got {count!r}")
+        if not 1 <= price_cents <= 99:
+            raise ValueError(f"price_cents must be 1..99, got {price_cents!r}")
+
+        body = {
+            "ticker": ticker,
+            "client_order_id": client_order_id or str(uuid.uuid4()),
+            "action": action,
+            "side": side,
+            "count": count,
+            "type": "limit",
+        }
+        body["yes_price" if side == "yes" else "no_price"] = price_cents
+        return self.post("/portfolio/orders", body=body, idempotent=retry)
+
+    def cancel_order(self, order_id: str) -> dict:
+        """
+        DELETE /portfolio/orders/{id}. Retried on 5xx/429, being idempotent.
+
+        Raises KalshiAPIError if the order is already gone (filled or cancelled
+        between listing it and cancelling it). RiskManager records that as a
+        failed cancel and keeps tracking the order, which is the safe reading
+        but does mean a benign race can block startup reconciliation. Treating
+        404 as success would fix that and is worth deciding deliberately.
+        """
+        return self.delete(f"/portfolio/orders/{order_id}")
+
+    def get_orders(self, *, ticker: str | None = None, status: str | None = None,
+                   cursor: str | None = None, limit: int | None = None) -> dict:
+        """
+        GET /portfolio/orders -> {"orders": [...], "cursor": "..."}
+
+        Callers must follow the cursor. Reading only the first page is the
+        silent failure mode: cancel what you saw, report success, leave the
+        rest resting on the exchange.
+        """
+        params = {"ticker": ticker, "status": status, "cursor": cursor, "limit": limit}
+        return self.get("/portfolio/orders", params=_clean(params))
+
+    def get_positions(self, *, ticker: str | None = None, cursor: str | None = None,
+                      limit: int | None = None,
+                      settlement_status: str | None = None) -> dict:
+        """
+        GET /portfolio/positions -> {"market_positions": [...], "cursor": "..."}
+
+        Each market position carries a signed `position`: positive is long yes,
+        negative is long no. Paginated, same as orders.
+
+        settlement_status defaults to the server's choice. Filtering to
+        unsettled positions would be more precise, but including settled ones
+        only over-states exposure, which fails safe — so this stays unset until
+        the parameter's accepted values are confirmed against the live API.
+        """
+        params = {"ticker": ticker, "cursor": cursor, "limit": limit,
+                  "settlement_status": settlement_status}
+        return self.get("/portfolio/positions", params=_clean(params))
 
 
 def build_client(**kwargs) -> KalshiClient:
