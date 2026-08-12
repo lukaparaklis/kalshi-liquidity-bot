@@ -1,0 +1,5 @@
+*.pem
+.env
+pools.json
+__pycache__/
+.venv/
