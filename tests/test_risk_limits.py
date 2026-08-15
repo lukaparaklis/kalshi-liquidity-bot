@@ -121,15 +121,17 @@ class FakeClient:
             }
         return {"orders": list(self.open_orders), "cursor": ""}
 
-    def create_order(self, ticker: str, side: str, count: int, price_cents: int) -> dict:
+    def create_order(self, ticker: str, side: str, count: int, price_cents: int,
+                     post_only: bool = True) -> dict:
         self._next_id += 1
         order_id = f"o{self._next_id}"
         self.created.append({
             "order_id": order_id, "ticker": ticker,
             "side": side, "count": count, "price_cents": price_cents,
         })
-        # Mirrors Kalshi's envelope so the real parsing path is exercised.
-        return {"order": {"order_id": order_id, "status": "resting"}}
+        # The v2 create response is flat — no {"order": ...} envelope.
+        return {"order_id": order_id, "fill_count": "0",
+                "remaining_count": str(count), "ts_ms": 1_700_000_000_000}
 
     def cancel_order(self, order_id: str) -> dict:
         # Lets a test simulate SIGINT landing while cancellation is in flight.
@@ -144,7 +146,29 @@ class FakeClient:
 
 def resting(order_id: str, *, ticker="MKT-A", side="yes", count=50, price=60,
             status="resting") -> dict:
-    """An order as GET /portfolio/orders returns it."""
+    """
+    An order as GET /portfolio/orders returns it, in v2 field names:
+    outcome_side/book_side, fixed-point counts, dollar-string prices.
+    """
+    return {
+        "order_id": order_id,
+        "ticker": ticker,
+        "outcome_side": side,
+        "book_side": "bid" if side == "yes" else "ask",
+        # Copied from a real payload: the legacy `side` field reads "yes" even
+        # on a no-side order. Present here so the parser is tested against the
+        # trap rather than a tidied-up version of it.
+        "side": "yes",
+        "status": status,
+        "remaining_count_fp": f"{count}.00",
+        "yes_price_dollars": f"{(price if side == 'yes' else 100 - price) / 100:.4f}",
+        "no_price_dollars": f"{(100 - price if side == 'yes' else price) / 100:.4f}",
+    }
+
+
+def resting_v1(order_id: str, *, ticker="MKT-A", side="yes", count=50,
+               price=60, status="resting") -> dict:
+    """The legacy shape, kept to prove the parser still tolerates it."""
     return {
         "order_id": order_id, "ticker": ticker, "side": side, "status": status,
         "remaining_count": count,
@@ -967,6 +991,101 @@ class TestPositionReconciliation:
 
         assert client.cancelled == ["stale-1"]
         assert not risk.reconciled
+
+    def test_v2_order_fields_parse(self):
+        """
+        Observed through a failed cancel, which is the one public path that
+        leaves a discovered order in the registry to inspect.
+        """
+        risk, client, _ = make_risk(
+            reconcile=False, open_orders=[resting("stale-1", count=50, price=60)],
+        )
+        client.fail_cancel_ids = {"stale-1"}
+
+        risk.reconcile()
+
+        order = risk.working_orders["stale-1"]
+        assert order.side == "yes"
+        assert order.count == 50
+        assert order.price_cents == 60
+
+    def test_v2_no_side_order_parses(self):
+        risk, client, _ = make_risk(
+            reconcile=False,
+            open_orders=[resting("stale-1", side="no", count=25, price=38)],
+        )
+        client.fail_cancel_ids = {"stale-1"}
+
+        risk.reconcile()
+
+        order = risk.working_orders["stale-1"]
+        assert order.side == "no"
+        assert order.count == 25
+        assert order.price_cents == 38
+
+    def test_legacy_v1_order_fields_still_parse(self):
+        """Tolerated on purpose: the field rename could not be verified live."""
+        risk, client, _ = make_risk(
+            reconcile=False,
+            open_orders=[resting_v1("stale-1", count=50, price=60)],
+        )
+        client.fail_cancel_ids = {"stale-1"}
+
+        risk.reconcile()
+
+        order = risk.working_orders["stale-1"]
+        assert order.side == "yes"
+        assert order.count == 50
+        assert order.price_cents == 60
+
+    def test_centicount_spelling_parses(self):
+        """
+        The published field list says remaining_count_fp, the changelog says
+        remaining_centicount_fp. Both are read; a count that silently reads as
+        0 would under-count exposure.
+        """
+        risk, client, _ = make_risk(reconcile=False)
+        client.open_orders = [{
+            "order_id": "stale-1", "ticker": "MKT-A", "outcome_side": "yes",
+            "status": "resting", "remaining_centicount_fp": "5000",
+            "yes_price_dollars": "0.6000",
+        }]
+        client.fail_cancel_ids = {"stale-1"}
+
+        risk.reconcile()
+
+        assert risk.working_orders["stale-1"].count == 50
+
+    def test_outcome_side_beats_the_misleading_legacy_side_field(self):
+        """
+        A real v2 no-side order carries side="yes" next to outcome_side="no".
+        Trusting `side` would flip the sign of every no position, so this is
+        the guard: the fixture above ships that exact contradiction.
+        """
+        risk, client, _ = make_risk(
+            reconcile=False,
+            open_orders=[resting("stale-1", side="no", count=10, price=38)],
+        )
+        client.fail_cancel_ids = {"stale-1"}
+
+        risk.reconcile()
+
+        assert risk.working_orders["stale-1"].side == "no"
+
+    def test_book_side_is_used_when_outcome_side_is_missing(self):
+        risk, client, _ = make_risk(reconcile=False)
+        client.open_orders = [{
+            "order_id": "stale-1", "ticker": "MKT-A", "book_side": "ask",
+            "status": "resting", "remaining_count_fp": "10.00",
+            "no_price_dollars": "0.3800",
+        }]
+        client.fail_cancel_ids = {"stale-1"}
+
+        risk.reconcile()
+
+        order = risk.working_orders["stale-1"]
+        assert order.side == "no"
+        assert order.price_cents == 38
 
     def test_reconciliation_can_be_retried_after_a_positions_failure(self):
         risk, client, _ = make_risk(reconcile=False, positions=[held("MKT-A", 80)])

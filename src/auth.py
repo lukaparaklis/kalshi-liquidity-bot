@@ -85,6 +85,35 @@ def log(msg: str) -> None:
     print(f"[{stamp}] {msg}", flush=True)
 
 
+def encode_order(side: str, price_cents: int) -> tuple[str, str]:
+    """
+    Translate this project's yes/no vocabulary into the v2 single-book shape.
+    Returns (book_side, price_as_dollar_string).
+
+    v2 replaced "buy yes / buy no" with one book quoted in yes terms and a
+    bid/ask direction. Kalshi's changelog calls outcome_side (yes/no) and
+    book_side (bid/ask) "the same directional bit in market vocabulary", so:
+
+        buy yes @ 60c  ->  bid @ "0.6000"
+        buy no  @ 38c  ->  ask @ "0.6200"      (selling yes at 62c)
+
+    VERIFIED against demo on 2026-08-15. Posting side=ask price="0.9900" came
+    back from GET /portfolio/orders as:
+
+        {"book_side": "ask", "outcome_side": "no",
+         "yes_price_dollars": "0.9900", "no_price_dollars": "0.0100"}
+
+    An ask at 0.99 is therefore buying NO at 1c, which is exactly what
+    encode_order("no", 1) produces. The bid leg matched too: side=bid
+    price="0.0100" returned outcome_side "yes" at yes_price_dollars "0.0100".
+    """
+    if side == "yes":
+        return "bid", f"{price_cents / 100:.4f}"
+    if side == "no":
+        return "ask", f"{(100 - price_cents) / 100:.4f}"
+    raise ValueError(f"side must be 'yes' or 'no', got {side!r}")
+
+
 def _clean(params: dict) -> dict | None:
     """Drop unset query params. Query strings are never part of the signature."""
     present = {key: value for key, value in params.items() if value is not None}
@@ -358,57 +387,93 @@ class KalshiClient:
     # RiskManager is the gateway that enforces limits before an order is sent.
 
     def create_order(self, ticker: str, side: str, count: int, price_cents: int,
-                     *, action: str = "buy", client_order_id: str | None = None,
+                     *, post_only: bool = True, client_order_id: str | None = None,
+                     time_in_force: str = "good_till_canceled",
+                     self_trade_prevention_type: str = "taker_at_cross",
                      retry: bool = False) -> dict:
         """
-        POST /portfolio/orders — a resting limit order.
+        POST /portfolio/events/orders — a resting limit order, v2.
 
-        `side` is "yes" or "no" and the price goes in the matching field;
-        `action` is "buy" or "sell". Both sides of a Kalshi market are bought,
-        which is why the quoter thinks in terms of yes/no rather than buy/sell.
+        The v1 endpoint now returns 410 deprecated_v1_order_endpoint. v2 takes
+        a bid/ask side with fixed-point dollar strings; see encode_order() for
+        the yes/no translation and the assumption it rests on.
+
+        post_only=True by default. A post-only order rests or is rejected — it
+        can never cross the spread. CLAUDE.md rates taking liquidity at ~4c a
+        contract and says crossing needs an extremely good reason, so the
+        exchange enforcing that is strictly better than us remembering to. Pass
+        post_only=False only where crossing is the deliberate point.
 
         retry=False by default, and that is a money decision, not an oversight.
         A create_order that times out may or may not have reached the matching
         engine, so replaying it can double the position. A client_order_id is
         always sent, which is what would MAKE a retry safe — but Kalshi's
         deduplication behaviour is not verified here, and a dropped quote costs
-        one requote cycle while a duplicate costs real money. Pass retry=True
-        only after confirming that dedup against a live account.
+        one requote cycle while a duplicate costs real money.
+
+        Returns the v2 response, which is flat: order_id, client_order_id,
+        fill_count, remaining_count, ts_ms — NOT wrapped in {"order": ...}.
         """
-        if side not in ("yes", "no"):
-            raise ValueError(f"side must be 'yes' or 'no', got {side!r}")
         if count <= 0:
             raise ValueError(f"count must be positive, got {count!r}")
         if not 1 <= price_cents <= 99:
             raise ValueError(f"price_cents must be 1..99, got {price_cents!r}")
 
+        book_side, price = encode_order(side, price_cents)
         body = {
             "ticker": ticker,
             "client_order_id": client_order_id or str(uuid.uuid4()),
-            "action": action,
-            "side": side,
-            "count": count,
-            "type": "limit",
+            "side": book_side,
+            "count": str(count),
+            "price": price,
+            "time_in_force": time_in_force,
+            "self_trade_prevention_type": self_trade_prevention_type,
+            "post_only": post_only,
         }
-        body["yes_price" if side == "yes" else "no_price"] = price_cents
-        return self.post("/portfolio/orders", body=body, idempotent=retry)
+        return self.post("/portfolio/events/orders", body=body, idempotent=retry)
 
     def cancel_order(self, order_id: str) -> dict:
         """
-        DELETE /portfolio/orders/{id}. Retried on 5xx/429, being idempotent.
+        DELETE /portfolio/events/orders/{id}, the v2 endpoint. Retried on
+        5xx/429, being idempotent.
 
-        Raises KalshiAPIError if the order is already gone (filled or cancelled
-        between listing it and cancelling it). RiskManager records that as a
-        failed cancel and keeps tracking the order, which is the safe reading
-        but does mean a benign race can block startup reconciliation. Treating
-        404 as success would fix that and is worth deciding deliberately.
+        A 404 counts as success, which is a deliberate reversal of the earlier
+        conservative reading. Two things observed on demo forced it:
+
+          - Cancelling an already-cancelled order returns 404 not_found.
+          - GET /portfolio/orders lags order state by a beat. Immediately after
+            placing two orders it reported none resting; immediately after
+            cancelling them it reported both.
+
+        Together those mean reconciliation routinely lists an order that is
+        already gone. Treating that as a failed cancel left the bot permanently
+        blocked at startup — a safety rule defeating itself. The goal of cancel
+        is "this order is not resting", and a 404 already satisfies it. Order
+        ids only ever come from the exchange or from our own place_order, so a
+        404 here cannot mean "wrong id".
         """
-        return self.delete(f"/portfolio/orders/{order_id}")
+        try:
+            return self.delete(f"/portfolio/events/orders/{order_id}")
+        except KalshiAPIError as exc:
+            if exc.status == 404:
+                log(f"cancel {order_id}: already gone (404)")
+                return {"order_id": order_id, "already_gone": True}
+            raise
 
     def get_orders(self, *, ticker: str | None = None, status: str | None = None,
                    cursor: str | None = None, limit: int | None = None) -> dict:
         """
         GET /portfolio/orders -> {"orders": [...], "cursor": "..."}
+
+        Still current — only the v1 order *mutation* endpoints returned 410, so
+        there is no /portfolio/events/orders GET to move to. Kalshi's changelog
+        does note that legacy portfolio endpoints now cost 10x the v2 rate-limit
+        budget, which matters for reconciliation frequency, not correctness.
+
+        Order objects use v2 field names: outcome_side (yes/no) rather than
+        side, remaining_count_fp rather than remaining_count, and
+        yes_price_dollars/no_price_dollars rather than integer cents.
+        RiskManager._parse_order reads both spellings.
 
         Callers must follow the cursor. Reading only the first page is the
         silent failure mode: cancel what you saw, report success, leave the

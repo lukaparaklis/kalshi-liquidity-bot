@@ -194,11 +194,14 @@ class RiskManager:
 
     # --- the order gateway ------------------------------------------------
 
-    def place_order(self, ticker: str, side: str, count: int,
-                    price_cents: int) -> WorkingOrder:
+    def place_order(self, ticker: str, side: str, count: int, price_cents: int,
+                    *, post_only: bool = True) -> WorkingOrder:
         """
         The only sanctioned path to the exchange. Raises RiskViolation without
         contacting the exchange if any limit would be breached.
+
+        post_only=True means the exchange rejects the order rather than letting
+        it cross the spread. Pass False only where crossing is the point.
         """
         if side not in SIDES:
             raise ValueError(f"side must be one of {SIDES}, got {side!r}")
@@ -222,8 +225,11 @@ class RiskManager:
 
         response = self.client.create_order(
             ticker=ticker, side=side, count=count, price_cents=price_cents,
+            post_only=post_only,
         )
-        order_id = ((response or {}).get("order") or {}).get("order_id")
+        # v2 responds flat; v1 wrapped it in {"order": {...}}. Accept both.
+        response = response or {}
+        order_id = response.get("order_id") or (response.get("order") or {}).get("order_id")
         if not order_id:
             # The order may or may not exist on the exchange. Say so loudly:
             # this is the one case where our view can silently diverge.
@@ -482,23 +488,63 @@ class RiskManager:
 
         return discovered
 
-    @staticmethod
-    def _parse_order(raw: dict) -> WorkingOrder | None:
+    @classmethod
+    def _parse_order(cls, raw: dict) -> WorkingOrder | None:
+        """
+        Read an order from GET /portfolio/orders.
+
+        Field precedence here is not cosmetic. A live v2 payload for an order
+        bought on the NO side reads:
+
+            {"outcome_side": "no", "book_side": "ask", "side": "yes", ...}
+
+        The legacy `side` field says "yes" on a no-side order — it was "yes" on
+        both orders in the demo probe and cannot be trusted. So the order is
+        outcome_side, then book_side (bid is yes, ask is no), and only then
+        `side` for a genuinely pre-v2 payload with neither. Reading `side`
+        first would flip the sign of every no-side position.
+        """
         order_id = raw.get("order_id")
         if not order_id:
             return None
-        side = str(raw.get("side") or "yes").lower()
-        count = raw.get("remaining_count")
-        if count is None:
-            count = raw.get("count") or 0
-        price = raw.get("yes_price" if side == "yes" else "no_price") or 0
+
+        side = str(raw.get("outcome_side") or "").lower()
+        if side not in SIDES:
+            book_side = str(raw.get("book_side") or "").lower()
+            if book_side in ("bid", "ask"):
+                side = "no" if book_side == "ask" else "yes"
+            else:
+                side = str(raw.get("side") or "yes").lower()
+                if side not in SIDES:
+                    side = "yes"
+
         return WorkingOrder(
             order_id=str(order_id),
             ticker=str(raw.get("ticker") or ""),
-            side=side if side in SIDES else "yes",
-            count=int(count),
-            price_cents=int(price),
+            side=side,
+            count=cls._parse_count(raw),
+            price_cents=cls._parse_price(raw, side),
         )
+
+    @staticmethod
+    def _parse_count(raw: dict) -> int:
+        """Remaining contracts, across the spellings v2 might use."""
+        for key in ("remaining_count_fp", "remaining_count"):
+            if raw.get(key) is not None:
+                return int(float(raw[key]))
+        # "centicount" is hundredths of a contract.
+        for key in ("remaining_centicount_fp", "remaining_centicount"):
+            if raw.get(key) is not None:
+                return int(float(raw[key]) / 100)
+        return int(float(raw.get("count") or 0))
+
+    @staticmethod
+    def _parse_price(raw: dict, side: str) -> int:
+        """Price in cents, from either dollar strings or legacy integers."""
+        dollars = raw.get(f"{side}_price_dollars")
+        if dollars is not None:
+            return round(float(dollars) * 100)
+        return int(raw.get(f"{side}_price") or 0)
 
     # --- shutdown ---------------------------------------------------------
 
