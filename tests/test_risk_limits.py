@@ -41,8 +41,11 @@ ASSUMPTIONS FLAGGED
     stale order, leaves the bot blocked rather than quoting on top of exposure
     it cannot see or could not clear.
   - Kalshi's market position is signed: positive is long yes, negative is long
-    no. That matches the internal convention. Field named "position" — verify
-    against a real payload before trusting it with money.
+    no, matching the internal convention. VERIFIED — the field is position_fp,
+    a decimal string, not the integer "position" this originally assumed. See
+    LIVE_POSITION_PAYLOAD below, captured from demo after a real fill. The
+    negative half is documented but not yet observed; only a long was
+    available.
 """
 
 from __future__ import annotations
@@ -176,9 +179,55 @@ def resting_v1(order_id: str, *, ticker="MKT-A", side="yes", count=50,
     }
 
 
-def held(ticker: str, position: int) -> dict:
-    """A position as GET /portfolio/positions returns it. Signed: +yes, -no."""
+def held(ticker: str, position: int, *, exposure: float = 0.0) -> dict:
+    """
+    A position as GET /portfolio/positions returns it in v2: position_fp is a
+    fixed-point decimal STRING, and dollar amounts are strings too. Signed —
+    positive is long yes, negative is long no.
+    """
+    return {
+        "ticker": ticker,
+        "position_fp": f"{position}.00",
+        "market_exposure_dollars": f"{exposure:.6f}",
+        "realized_pnl_dollars": "0.000000",
+        "fees_paid_dollars": "0.000000",
+        "total_traded_dollars": f"{exposure:.6f}",
+    }
+
+
+def held_v1(ticker: str, position: int) -> dict:
+    """The legacy integer shape, kept to prove the parser still tolerates it."""
     return {"ticker": ticker, "position": position}
+
+
+# Copied verbatim from GET /portfolio/positions on demo, 2026-08-15, after
+# verify_safety.py fill bought one contract. This is the payload that exposed
+# the bug: the parser looked for "position", which does not exist here, so the
+# inherited position read as zero and the limits enforced nothing.
+LIVE_POSITION_PAYLOAD = {
+    "cursor": "",
+    "event_positions": [
+        {
+            "event_exposure_dollars": "0.290000",
+            "event_ticker": "KXA100W-26AUG21",
+            "fees_paid_dollars": "0.014500",
+            "realized_pnl_dollars": "0.000000",
+            "total_cost_dollars": "0.290000",
+            "total_cost_shares_fp": "1.00",
+        }
+    ],
+    "market_positions": [
+        {
+            "fees_paid_dollars": "0.014500",
+            "last_updated_ts": "2026-08-15T23:07:47.666008Z",
+            "market_exposure_dollars": "0.290000",
+            "position_fp": "1.00",
+            "realized_pnl_dollars": "0.000000",
+            "ticker": "KXA100W-26AUG21-1.04",
+            "total_traded_dollars": "0.290000",
+        }
+    ],
+}
 
 
 def make_risk(*, per_market=100, aggregate=250, max_daily_loss_cents=5_000,
@@ -856,6 +905,66 @@ class TestPositionReconciliation:
     So startup seeds positions from GET /portfolio/positions. Signed, matching
     the internal convention: positive is long yes, negative is long no.
     """
+
+    def test_the_live_v2_payload_parses(self):
+        """
+        Regression for the bug verify_safety.py fill exposed. Reading
+        "position" instead of "position_fp" made a real, funded position read
+        as zero — the limits believed the account was flat while it was not.
+        """
+        risk, client, _ = make_risk(reconcile=False)
+        client.positions = LIVE_POSITION_PAYLOAD["market_positions"]
+
+        risk.reconcile()
+
+        assert risk.position("KXA100W-26AUG21-1.04") == 1
+        assert risk.exposure("KXA100W-26AUG21-1.04") == 1
+        assert risk.exposure_dollars("KXA100W-26AUG21-1.04") == pytest.approx(0.29)
+
+    def test_a_short_position_comes_back_negative(self):
+        """
+        Documented: "Negative means NO contracts and positive means YES
+        contracts". Only a long was available to observe live, so this pins the
+        documented half. If shorts ever arrive unsigned, exposure for a no
+        position reads as long and the caps guard the wrong direction.
+        """
+        risk, client, _ = make_risk(reconcile=False)
+        client.positions = [{
+            "ticker": "MKT-A", "position_fp": "-3.00",
+            "market_exposure_dollars": "1.110000",
+        }]
+
+        risk.reconcile()
+
+        assert risk.position("MKT-A") == -3
+        assert risk.exposure("MKT-A") == 3
+
+    def test_fixed_point_strings_do_not_truncate(self):
+        """round(), not int(): "3.00" arriving as 2.9999 must not read as 2."""
+        risk, client, _ = make_risk(reconcile=False)
+        client.positions = [{"ticker": "MKT-A", "position_fp": "3.00"}]
+
+        risk.reconcile()
+
+        assert risk.position("MKT-A") == 3
+
+    def test_a_legacy_integer_position_still_parses(self):
+        risk, client, _ = make_risk(reconcile=False, positions=[held_v1("MKT-A", 80)])
+
+        risk.reconcile()
+
+        assert risk.position("MKT-A") == 80
+
+    def test_a_missing_exposure_figure_is_not_fatal(self):
+        """Dollar exposure is reporting only; its absence must not block anything."""
+        risk, client, _ = make_risk(reconcile=False)
+        client.positions = [{"ticker": "MKT-A", "position_fp": "2.00"}]
+
+        risk.reconcile()
+
+        assert risk.position("MKT-A") == 2
+        assert risk.exposure_dollars("MKT-A") == 0.0
+        assert risk.reconciled
 
     def test_inherited_positions_are_seeded(self):
         risk, _, _ = make_risk(

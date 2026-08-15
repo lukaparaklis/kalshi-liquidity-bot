@@ -76,6 +76,23 @@ class RiskViolation(Exception):
         super().__init__(message)
 
 
+def _to_float(value) -> float:
+    """v2 sends numbers as strings ("1.00", "0.290000"). Never raise on junk."""
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+@dataclass(frozen=True)
+class InheritedPosition:
+    """A position found on the account at startup."""
+
+    ticker: str
+    contracts: int          # signed: positive long yes, negative long no
+    exposure_dollars: float  # cost of the aggregate position
+
+
 @dataclass
 class WorkingOrder:
     order_id: str
@@ -104,6 +121,7 @@ class RiskManager:
 
         self._working: dict[str, WorkingOrder] = {}
         self._positions: dict[str, int] = {}
+        self._position_values: dict[str, float] = {}
         self._daily_pnl_cents = 0
         self._halted = False
         self._halt_reason: str | None = None
@@ -151,6 +169,14 @@ class RiskManager:
     def exposure(self, ticker: str) -> int:
         with self._lock:
             return self._exposure(ticker)
+
+    def exposure_dollars(self, ticker: str) -> float:
+        """
+        Cost of the inherited position in this market, as the exchange reported
+        it. Reporting only — the limits are counted in contracts.
+        """
+        with self._lock:
+            return self._position_values.get(ticker, 0.0)
 
     def aggregate_exposure(self) -> int:
         with self._lock:
@@ -425,20 +451,24 @@ class RiskManager:
             return False
 
         with self._lock:
-            self._positions = found
+            self._positions = {t: p.contracts for t, p in found.items()}
+            self._position_values = {t: p.exposure_dollars for t, p in found.items()}
         if found:
-            summary = ", ".join(f"{t}={p:+d}" for t, p in sorted(found.items()))
+            summary = ", ".join(
+                f"{p.ticker}={p.contracts:+d} (${p.exposure_dollars:.2f})"
+                for p in sorted(found.values(), key=lambda p: p.ticker)
+            )
             log(f"reconcile: inherited {len(found)} position(s): {summary}")
         return True
 
-    def _fetch_positions(self) -> dict[str, int]:
+    def _fetch_positions(self) -> dict[str, InheritedPosition]:
         """
-        Every page of positions, signed: positive long yes, negative long no.
+        Every page of positions.
 
         Flat positions are dropped — the API reports settled and closed markets
         too, and they are not exposure.
         """
-        found: dict[str, int] = {}
+        found: dict[str, InheritedPosition] = {}
         cursor: str | None = None
         seen_cursors: set[str] = set()
 
@@ -446,9 +476,13 @@ class RiskManager:
             page = self.client.get_positions(cursor=cursor) or {}
             for raw in page.get("market_positions") or []:
                 ticker = raw.get("ticker")
-                position = int(raw.get("position") or 0)
-                if ticker and position:
-                    found[str(ticker)] = position
+                contracts = self._parse_contracts(raw)
+                if ticker and contracts:
+                    found[str(ticker)] = InheritedPosition(
+                        ticker=str(ticker),
+                        contracts=contracts,
+                        exposure_dollars=_to_float(raw.get("market_exposure_dollars")),
+                    )
 
             cursor = page.get("cursor") or ""
             if not cursor or cursor in seen_cursors:
@@ -458,6 +492,26 @@ class RiskManager:
             log(f"reconcile: stopped after {MAX_RECONCILE_PAGES} position pages")
 
         return found
+
+    @staticmethod
+    def _parse_contracts(raw: dict) -> int:
+        """
+        Signed contract count from a v2 market position.
+
+        v2 reports position_fp, a fixed-point decimal STRING ("1.00"), not the
+        integer `position` field this originally read — which silently returned
+        None, floored to 0, and made every inherited position invisible to the
+        limits. Documented sign convention, matching the internal one:
+        "Negative means NO contracts and positive means YES contracts".
+
+        Rounded rather than truncated: int("3.00" -> 2.9999) would read 3
+        contracts as 2, and under-counting exposure is the failure that matters
+        here. Kalshi contracts are whole, so rounding loses nothing.
+        """
+        for key in ("position_fp", "position"):
+            if raw.get(key) is not None:
+                return round(_to_float(raw[key]))
+        return 0
 
     def _fetch_resting_orders(self) -> dict[str, WorkingOrder]:
         """
