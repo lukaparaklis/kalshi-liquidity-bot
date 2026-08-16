@@ -93,6 +93,22 @@ def _normalize(levels: Iterable[tuple[int, int]]) -> list[tuple[int, int]]:
     return sorted(totals.items(), key=lambda level: -level[0])
 
 
+def _parse_levels(raw, *, dollars: bool) -> list[tuple[int, int]]:
+    """
+    Raw API levels -> [(price_cents, size)]. Malformed rows are skipped: a
+    scanner sweeping hundreds of markets must not die on one bad row.
+    """
+    out: list[tuple[int, int]] = []
+    for entry in raw or []:
+        try:
+            price, size = entry[0], entry[1]
+            cents = round(float(price) * 100) if dollars else int(float(price))
+            out.append((cents, int(float(size))))
+        except (TypeError, ValueError, IndexError, KeyError):
+            continue
+    return out
+
+
 @dataclass
 class OrderBook:
     """
@@ -109,6 +125,36 @@ class OrderBook:
     def __post_init__(self) -> None:
         self.yes = _normalize(self.yes)
         self.no = _normalize(self.no)
+
+    @classmethod
+    def from_api(cls, payload: dict) -> "OrderBook":
+        """
+        Build from a GET /markets/{ticker}/orderbook response.
+
+        v2 nests the book under "orderbook_fp" as yes_dollars/no_dollars, with
+        dollar-string prices and fixed-point string sizes:
+
+            {"orderbook_fp": {"yes_dollars": [["0.0100", "2.00"]], ...}}
+
+        The v1 "orderbook" -> yes/no shape used integer cents and is still read
+        as a fallback. Which key was present decides how the numbers are
+        interpreted — 60 (v1 cents) and "0.6000" (v2 dollars) are the same
+        price, so guessing from the value alone would be wrong by 100x.
+
+        Reading the wrong key returns an empty book rather than raising, which
+        is exactly how the scanner once concluded the whole exchange was dead.
+        Hence one parser, here, with tests.
+        """
+        payload = payload or {}
+
+        book = payload.get("orderbook_fp")
+        if book is not None:
+            return cls(yes=_parse_levels(book.get("yes_dollars"), dollars=True),
+                       no=_parse_levels(book.get("no_dollars"), dollars=True))
+
+        book = payload.get("orderbook") or {}
+        return cls(yes=_parse_levels(book.get("yes"), dollars=False),
+                   no=_parse_levels(book.get("no"), dollars=False))
 
     def levels(self, side: str) -> list[tuple[int, int]]:
         """
