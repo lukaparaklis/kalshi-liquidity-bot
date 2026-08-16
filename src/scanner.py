@@ -37,7 +37,8 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
-from .auth import KalshiAPIError, build_client, log
+from .auth import (KalshiAPIError, build_client,
+                   build_readonly_prod_client, log)
 from .book import OrderBook
 from .economics import (
     TARGET_SIZE_ASSUMPTION,
@@ -50,7 +51,12 @@ from .economics import (
     two_sided_ok,
 )
 
-POOLS_FILE = Path("pools.json")
+# Anchored to the repo, NOT the working directory. As a relative path this
+# silently resolved against wherever the command happened to be run from, found
+# nothing, loaded no pools, and left the scanner ranking arbitrary discovered
+# series — which looks exactly like a wrong pools.json rather than a missing one.
+REPO_ROOT = Path(__file__).resolve().parent.parent
+POOLS_FILE = REPO_ROOT / "pools.json"
 
 MARKET_PAGE_SIZE = 200
 SERIES_LIMIT = 40       # series probed, one /markets request each
@@ -67,19 +73,51 @@ DEFAULT_HOURS = 24.0
 # POOLS
 # ---------------------------------------------------------------------------
 
-def load_pools() -> dict[str, float]:
-    """
-    Read pools.json. Keys beginning with "_" are treated as comments, since the
-    file is hand-maintained from the incentives page and needs annotating.
-    """
+def _load_raw_pools() -> dict:
+    """Entries from pools.json, minus "_" comment keys."""
     if not POOLS_FILE.exists():
         return {}
     try:
         raw = json.loads(POOLS_FILE.read_text())
-        return {k: float(v) for k, v in raw.items() if not k.startswith("_")}
+        return {k: v for k, v in raw.items() if not k.startswith("_")}
     except (ValueError, TypeError, AttributeError) as exc:
         log(f"{POOLS_FILE} is unreadable ({exc}); continuing without pools")
         return {}
+
+
+def load_pools() -> dict[str, float]:
+    """
+    Daily pool per event ticker.
+
+    An entry is either a bare number or an object carrying the incentives
+    page's liquidity rating alongside it:
+
+        "KXH200WS-26SEP11": 165.0
+        "KXH200WS-26SEP11": {"pool": 165.0, "liquidity": "Low"}
+    """
+    pools = {}
+    for key, value in _load_raw_pools().items():
+        try:
+            pools[key] = float(value["pool"] if isinstance(value, dict) else value)
+        except (TypeError, ValueError, KeyError):
+            log(f"pools.json: skipping {key}, no usable pool value")
+    return pools
+
+
+def load_liquidity() -> dict[str, str]:
+    """
+    The incentives page's Low/Medium/High rating per event, where given.
+
+    It is a competition proxy, and a coarse one — the scanner measures actual
+    resting depth, which is the thing the rating approximates. Kept because it
+    is the exchange's own view and disagreement with measured depth is worth
+    seeing.
+    """
+    ratings = {}
+    for key, value in _load_raw_pools().items():
+        if isinstance(value, dict) and value.get("liquidity"):
+            ratings[key] = str(value["liquidity"]).strip().title()
+    return ratings
 
 
 def match_pool(event_ticker: str, pools: dict[str, float]) -> float | None:
@@ -99,6 +137,26 @@ def match_pool(event_ticker: str, pools: dict[str, float]) -> float | None:
     if not matches:
         return None
     return max(matches, key=lambda kv: len(kv[0]))[1]
+
+
+def series_of_event(event_ticker: str) -> str:
+    """
+    The series an event belongs to: KXB200MS-26AUG -> KXB200MS.
+
+    Event tickers are SERIES-PERIOD, and /markets can only be queried by
+    series, so this is how a pooled event turns into a fetchable request.
+    """
+    return str(event_ticker or "").rsplit("-", 1)[0]
+
+
+def events_from_pools(pools: dict[str, float]) -> list[str]:
+    """
+    Pool keys that name an actual event, i.e. contain a period suffix.
+
+    A bare prefix like "KXB200" cannot be fetched — it is not a series — so it
+    is usable for looking a pool UP but not for discovering markets.
+    """
+    return [key for key in pools if "-" in key]
 
 
 def count_markets_per_event(markets: list[dict]) -> dict[str, int]:
@@ -182,6 +240,7 @@ def select_series(series: list[dict], *, categories: set[str] | None = None,
 
 
 def fetch_open_markets(client, *, series_tickers: list[str] | None = None,
+                       events: list[str] | None = None,
                        categories: set[str] | None = None,
                        series_limit: int = SERIES_LIMIT,
                        include_fast: bool = False) -> list[dict]:
@@ -198,7 +257,13 @@ def fetch_open_markets(client, *, series_tickers: list[str] | None = None,
     are MVE) and then asks for each series' markets by name. Bounded by
     series_limit, since that is one request per series.
     """
-    if series_tickers:
+    wanted_events = set(events or [])
+
+    if wanted_events:
+        chosen = [{"ticker": t} for t in sorted({series_of_event(e) for e in wanted_events})]
+        log(f"scanning {len(wanted_events)} pooled event(s) across "
+            f"{len(chosen)} series: {', '.join(sorted(wanted_events))}")
+    elif series_tickers:
         chosen = [{"ticker": t} for t in series_tickers]
         log(f"scanning {len(chosen)} explicitly requested series")
     else:
@@ -223,6 +288,10 @@ def fetch_open_markets(client, *, series_tickers: list[str] | None = None,
             log(f"  series {ticker}: {exc.status}")
             continue
         markets += data.get("markets") or []
+
+    if wanted_events:
+        # A series holds many events; keep only the ones carrying a pool.
+        markets = [m for m in markets if m.get("event_ticker") in wanted_events]
 
     # Belt and braces: drop MVE at the market level too, in case a series slips
     # through under a name that does not start with KXMVE.
@@ -255,6 +324,7 @@ class Scan:
     event_ticker: str = ""
     event_pool: float | None = None
     markets_in_event: int = 1
+    liquidity: str = ""           # the incentives page's Low/Medium/High
 
     def __post_init__(self):
         self.yes_ref = self.book.reference_price("yes", self.target_size)
@@ -279,6 +349,25 @@ class Scan:
         return self.yes_ref is not None and self.no_ref is not None
 
     @property
+    def total_depth(self) -> int:
+        """Every resting contract on both sides: the competition, measured."""
+        return (sum(size for _, size in self.book.yes)
+                + sum(size for _, size in self.book.no))
+
+    @property
+    def pool_per_depth(self) -> float | None:
+        """
+        Daily pool dollars per resting contract already on the book.
+
+        This is the reward-density measure: a big pool on a thin book beats a
+        bigger pool on a mobbed one. It is what the page's Low/Medium/High
+        rating gestures at, computed from the actual book instead.
+        """
+        if self.pool is None:
+            return None
+        return self.pool / max(self.total_depth, 1)
+
+    @property
     def net_dollars(self) -> float | None:
         if self.reward.dollars_per_day is None:
             return None
@@ -289,8 +378,8 @@ class Scan:
         """Net dollars when the pool is known, else share per dollar of fill risk."""
         if not self.quotable:
             return float("-inf")
-        if self.net_dollars is not None:
-            return self.net_dollars
+        if self.pool_per_depth is not None:
+            return self.pool_per_depth
         return self.reward.share / (self.fill_cost + 0.01)
 
 
@@ -298,12 +387,33 @@ def scan_markets(client, *, my_size: int, hours: float, probe: int,
                  target_size: int, series_tickers: list[str] | None = None,
                  categories: set[str] | None = None,
                  series_limit: int = SERIES_LIMIT,
-                 include_fast: bool = False) -> list[Scan]:
+                 include_fast: bool = False,
+                 from_pools: bool = False) -> list[Scan]:
     pools = load_pools()
+    ratings = load_liquidity()
     if not pools:
-        log(f"no {POOLS_FILE} — ranking by reward share per dollar of fill risk")
+        log(f"WARNING: no pools loaded from {POOLS_FILE}")
+        log("  Without pools there is no reward estimate, so the ranking falls "
+            "back to share per dollar of fill risk over whatever series "
+            "discovery happens to return.")
+    else:
+        log(f"{len(pools)} pool entr(ies) from {POOLS_FILE}: "
+            f"{', '.join(sorted(pools))}")
+
+    events = None
+    if from_pools:
+        events = events_from_pools(pools)
+        prefixes = [k for k in pools if "-" not in k]
+        if prefixes:
+            log(f"ignoring {len(prefixes)} prefix-only pool key(s) for discovery "
+                f"({', '.join(sorted(prefixes))}); they still resolve pools but "
+                f"name no event to fetch")
+        if not events:
+            sys.exit(f"--from-pools needs event tickers in {POOLS_FILE}, "
+                     f"e.g. KXB200MS-26AUG. Only prefixes were found.")
 
     markets = fetch_open_markets(client, series_tickers=series_tickers,
+                                 events=events,
                                  categories=categories, series_limit=series_limit,
                                  include_fast=include_fast)
     # Counted over EVERY open market found, not just the ones probed: an
@@ -333,7 +443,8 @@ def scan_markets(client, *, my_size: int, hours: float, probe: int,
                           target_size=target_size, my_size=my_size, hours=hours,
                           pool=share, event_ticker=event,
                           event_pool=match_pool(event, pools),
-                          markets_in_event=count))
+                          markets_in_event=count,
+                          liquidity=ratings.get(event, "")))
 
     scans.sort(key=lambda s: s.rank_key, reverse=True)
     return scans
@@ -352,24 +463,25 @@ def print_assumptions(target_size: int) -> None:
 
 
 def print_table(scans: list[Scan], target_size: int) -> None:
-    header = (f"  {'ticker':<38} {'vol24':>8} {'ref_y':>5} {'ref_n':>5} "
-              f"{'2sd':>3} {'share':>6} {'vld':>5} {'mkts':>5} {'pool/mkt':>9} "
-              f"{'rwd/d':>7} {'fill/d':>7} {'net/d':>7}")
+    header = (f"  {'ticker':<34} {'liq':>6} {'depth':>9} {'pool/mkt':>9} "
+              f"{'$/1k depth':>11} {'ref_y':>5} {'ref_n':>5} {'2sd':>3} "
+              f"{'share':>6} {'rwd/d':>7} {'fill/d':>7} {'net/d':>7}")
     print(header)
     print("  " + "-" * (len(header) - 2))
 
     for scan in scans:
         reward = scan.reward.dollars_per_day
         net = scan.net_dollars
+        density = scan.pool_per_depth
         print(
-            f"  {scan.ticker[:38]:<38} {scan.volume:>8.0f} "
+            f"  {scan.ticker[:34]:<34} {(scan.liquidity or '-'):>6} "
+            f"{scan.total_depth:>9,} "
+            f"{(f'{scan.pool:.3f}' if scan.pool is not None else '-'):>9} "
+            f"{(f'{density * 1000:.3f}' if density is not None else '-'):>11} "
             f"{(scan.yes_ref.price if scan.yes_ref else '-'):>5} "
             f"{(scan.no_ref.price if scan.no_ref else '-'):>5} "
             f"{('Y' if scan.two_sided else 'n'):>3} "
             f"{scan.reward.share * 100:>5.2f}% "
-            f"{scan.reward.valid_fraction:>5.2f} "
-            f"{scan.markets_in_event:>5} "
-            f"{(f'{scan.pool:.3f}' if scan.pool is not None else '-'):>9} "
             f"{(f'{reward:.3f}' if reward is not None else '-'):>7} "
             f"{scan.fill_cost:>7.2f} "
             f"{(f'{net:+.3f}' if net is not None else '-'):>7}"
@@ -398,12 +510,24 @@ def print_table(scans: list[Scan], target_size: int) -> None:
 
 def cmd_scan(client, args) -> int:
     print_assumptions(args.target_size)
+
+    # Rewards only exist where a pool exists, so if pools.json names events,
+    # scan those unless told otherwise. Blind discovery returns series in
+    # arbitrary order — MLB strikeouts, restaurant closures — which is a
+    # confusing default for a tool whose whole subject is reward pools.
+    if (not args.from_pools and not args.all_series
+            and not args.series and not args.category):
+        if events_from_pools(load_pools()):
+            args.from_pools = True
+            log("targeting the events in pools.json (--all-series to scan "
+                "discovered series instead)")
     scans = scan_markets(client, my_size=args.size, hours=args.hours,
                          probe=args.probe, target_size=args.target_size,
                          series_tickers=args.series,
                          categories=set(args.category) if args.category else None,
                          series_limit=args.series_limit,
-                         include_fast=args.include_fast)
+                         include_fast=args.include_fast,
+                         from_pools=args.from_pools)
     if not scans:
         log("nothing to rank")
         return 1
@@ -436,6 +560,9 @@ def cmd_book(client, args) -> int:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--prod", action="store_true",
+                        help="read PROD books with the read-only prod credential. "
+                             "The scanner never writes; demo has no liquidity.")
     parser.add_argument("--target-size", type=int, default=TARGET_SIZE_ASSUMPTION,
                         help=f"ASSUMED Target Size (default {TARGET_SIZE_ASSUMPTION}); "
                              "Kalshi does not publish it per market")
@@ -455,6 +582,12 @@ def main() -> int:
                            "'Climate and Weather'; repeatable")
     scan.add_argument("--series-limit", type=int, default=SERIES_LIMIT,
                       help=f"series to probe when discovering (default {SERIES_LIMIT})")
+    scan.add_argument("--from-pools", action="store_true",
+                      help=f"scan exactly the event tickers listed in {POOLS_FILE}. "
+                           "Rewards only exist where there is a pool, so this is "
+                           "usually what you want.")
+    scan.add_argument("--all-series", action="store_true",
+                      help="scan discovered series instead of the pooled events")
     scan.add_argument("--include-fast", action="store_true",
                       help="include fifteen_min/hourly series, which CLAUDE.md "
                            "rejects as structurally adversely selected")
@@ -463,8 +596,20 @@ def main() -> int:
     detail.add_argument("ticker")
 
     args = parser.parse_args()
-    client = build_client()
-    log(f"env={client.creds.env} (read-only; this command places no orders)")
+
+    # Scanning demo is close to useless: it carries the same market listings as
+    # prod but almost no resting liquidity, so every book reads empty and every
+    # market looks unquotable. CLAUDE.md marks the scanner read-only and safe
+    # against prod. The choice is explicit rather than inferred — silently
+    # picking an environment is how a "prod" scan ends up reading demo.
+    if args.prod:
+        client = build_readonly_prod_client()
+        log(f"env=prod via {type(client).__name__} — READ-ONLY, writes raise")
+    else:
+        client = build_client()
+        log(f"env={client.creds.env} (read-only; this command places no orders)")
+        log("demo has the market listings but no resting liquidity, so books "
+            "will read empty. Pass --prod to scan real books.")
 
     return {"scan": cmd_scan, "book": cmd_book}[args.mode](client, args)
 
