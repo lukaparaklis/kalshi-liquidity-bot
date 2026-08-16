@@ -50,6 +50,8 @@ ASSUMPTIONS FLAGGED
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 
 from src.risk import RiskLimits, RiskManager, RiskViolation
@@ -396,6 +398,60 @@ class TestPositionLimitsArePreOrder:
 # ---------------------------------------------------------------------------
 # SAFETY RULE 4 — DAILY LOSS LIMIT
 # ---------------------------------------------------------------------------
+
+class TestLiveMustBeConfirmedInCode:
+    """
+    Safety rule 5: live mode requires explicit confirmation, never a flag alone.
+
+    The gateway refuses a prod client outright unless the caller opted in when
+    constructing it. Config alone cannot make this bot trade real money —
+    someone has to have written allow_live=True.
+    """
+
+    @staticmethod
+    def _point_at_prod(client):
+        client.creds = SimpleNamespace(is_prod=True, env="prod")
+
+    def test_a_prod_client_is_refused_by_default(self):
+        risk, client, _ = make_risk()
+        self._point_at_prod(client)
+
+        with pytest.raises(RiskViolation) as excinfo:
+            risk.place_order("MKT-A", "yes", count=10, price_cents=60)
+
+        assert excinfo.value.kind == "live_not_confirmed"
+        assert client.created == []
+
+    def test_opting_in_permits_it(self):
+        clock = FakeClock()
+        client = FakeClient()
+        self._point_at_prod(client)
+        risk = RiskManager(
+            RiskLimits(100, 250, 5_000, DEADMAN_TIMEOUT_S),
+            client=client, clock=clock, allow_live=True,
+        )
+        risk.reconcile()
+
+        risk.place_order("MKT-A", "yes", count=10, price_cents=60)
+
+        assert len(client.created) == 1
+
+    def test_a_demo_client_is_unaffected(self):
+        risk, client, _ = make_risk()
+        client.creds = SimpleNamespace(is_prod=False, env="demo")
+
+        risk.place_order("MKT-A", "yes", count=10, price_cents=60)
+
+        assert len(client.created) == 1
+
+    def test_a_client_without_credentials_is_not_treated_as_live(self):
+        """Duck-typed fakes have no creds; they must not trip the guard."""
+        risk, client, _ = make_risk()
+
+        risk.place_order("MKT-A", "yes", count=10, price_cents=60)
+
+        assert len(client.created) == 1
+
 
 class TestDailyLossLimit:
     """

@@ -114,10 +114,15 @@ class CancelAllResult:
 
 class RiskManager:
     def __init__(self, limits: RiskLimits, *, client,
-                 clock: Callable[[], float] = time.monotonic):
+                 clock: Callable[[], float] = time.monotonic,
+                 allow_live: bool = False):
         self.limits = limits
         self.client = client
         self._clock = clock
+        # Safety rule 5: live mode is opt-in, never inherited from config. A
+        # client pointed at prod cannot place an order through this gateway
+        # unless the caller said so in code.
+        self.allow_live = allow_live
 
         self._working: dict[str, WorkingOrder] = {}
         self._positions: dict[str, int] = {}
@@ -239,6 +244,13 @@ class RiskManager:
         # cancels orders over the network.
         self.check_deadman()
 
+        if self._client_is_prod() and not self.allow_live:
+            raise RiskViolation(
+                "live_not_confirmed",
+                "client is pointed at prod and allow_live was not set; refusing "
+                "to place a real-money order",
+            )
+
         with self._lock:
             if not self._reconciled:
                 raise RiskViolation(
@@ -265,6 +277,14 @@ class RiskManager:
         with self._lock:
             self._working[order_id] = order
         return order
+
+    def _client_is_prod(self) -> bool:
+        """
+        True when the attached client points at production. Duck-typed clients
+        (tests, fakes) have no creds and are treated as not-prod.
+        """
+        creds = getattr(self.client, "creds", None)
+        return bool(getattr(creds, "is_prod", False))
 
     def _check_position_limits(self, ticker: str, side: str, count: int) -> None:
         projected = self._exposure(ticker, side, count)

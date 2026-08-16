@@ -64,6 +64,10 @@ class KalshiConfigError(KalshiError):
     """Missing or unusable credentials/config."""
 
 
+class ReadOnlyError(KalshiError):
+    """A write was attempted through a client that cannot write."""
+
+
 class KalshiAPIError(KalshiError):
     """Non-retryable HTTP error, or retries exhausted."""
 
@@ -191,19 +195,7 @@ def _normalize_env(raw: str | None) -> str:
     return "prod" if value in ("prod", "production", "live") else "demo"
 
 
-def load_credentials(env_file: Path | str | None = DEFAULT_ENV_FILE) -> Credentials:
-    """Load key id, private key and target environment from .env / os.environ."""
-    if env_file is not None:
-        load_dotenv(env_file)
-
-    key_id = os.environ.get("KALSHI_KEY_ID", "").strip().strip("\"'")
-    key_path_raw = os.environ.get("KALSHI_PRIVATE_KEY_PATH", "").strip().strip("\"'")
-
-    if not key_id:
-        raise KalshiConfigError("KALSHI_KEY_ID is not set (check .env)")
-    if not key_path_raw:
-        raise KalshiConfigError("KALSHI_PRIVATE_KEY_PATH is not set (check .env)")
-
+def _read_private_key(key_path_raw: str) -> rsa.RSAPrivateKey:
     key_path = Path(key_path_raw).expanduser()
     if not key_path.exists():
         raise KalshiConfigError(f"private key not found at {key_path}")
@@ -226,13 +218,70 @@ def load_credentials(env_file: Path | str | None = DEFAULT_ENV_FILE) -> Credenti
             f"key at {key_path} is {type(private_key).__name__}, not RSA. Kalshi "
             "signs with RSA-PSS."
         )
+    return private_key
+
+
+def _env_value(name: str) -> str:
+    return os.environ.get(name, "").strip().strip("\"'")
+
+
+def load_credentials(env_file: Path | str | None = DEFAULT_ENV_FILE) -> Credentials:
+    """Load key id, private key and target environment from .env / os.environ."""
+    if env_file is not None:
+        load_dotenv(env_file)
+
+    key_id = _env_value("KALSHI_KEY_ID")
+    key_path_raw = _env_value("KALSHI_PRIVATE_KEY_PATH")
+
+    if not key_id:
+        raise KalshiConfigError("KALSHI_KEY_ID is not set (check .env)")
+    if not key_path_raw:
+        raise KalshiConfigError("KALSHI_PRIVATE_KEY_PATH is not set (check .env)")
 
     env = _normalize_env(os.environ.get("KALSHI_ENV"))
     return Credentials(
         key_id=key_id,
-        private_key=private_key,
+        private_key=_read_private_key(key_path_raw),
         env=env,
         base_url=PROD_BASE if env == "prod" else DEMO_BASE,
+    )
+
+
+def load_readonly_prod_credentials(
+        env_file: Path | str | None = DEFAULT_ENV_FILE) -> Credentials:
+    """
+    Credentials for READING prod. Separate variables, separate key, on purpose.
+
+    KALSHI_PROD_KEY_ID / KALSHI_PROD_PRIVATE_KEY_PATH, and deliberately NOT
+    KALSHI_ENV. Paper mode needs prod books because demo has no liquidity worth
+    quoting against, but pointing the ordinary trading client at prod by
+    flipping one environment variable is exactly the accident this project
+    cannot afford. The two paths cannot be confused because they read different
+    variables, and this one is only ever handed to a ReadOnlyClient.
+
+    Give the key trade permissions only if you want to find out the hard way
+    that a scope grant is not a safety mechanism — the read-only guarantee here
+    comes from the client type, but a read-only API key is a good second layer.
+    """
+    if env_file is not None:
+        load_dotenv(env_file)
+
+    key_id = _env_value("KALSHI_PROD_KEY_ID")
+    key_path_raw = _env_value("KALSHI_PROD_PRIVATE_KEY_PATH")
+
+    if not key_id or not key_path_raw:
+        raise KalshiConfigError(
+            "paper mode reads prod books and needs its own read-only credential.\n"
+            "Set KALSHI_PROD_KEY_ID and KALSHI_PROD_PRIVATE_KEY_PATH in .env.\n"
+            "Use a key with read-only permissions; the client refuses writes "
+            "regardless, but defence in depth is the point."
+        )
+
+    return Credentials(
+        key_id=key_id,
+        private_key=_read_private_key(key_path_raw),
+        env="prod",
+        base_url=PROD_BASE,
     )
 
 
@@ -501,9 +550,50 @@ class KalshiClient:
         return self.get("/portfolio/positions", params=_clean(params))
 
 
+class ReadOnlyClient(KalshiClient):
+    """
+    A Kalshi client that cannot trade.
+
+    Not a flag, not a mode, not a check the caller has to remember: the write
+    path raises before any request is built. `request` is overridden rather
+    than only the order helpers, so a method added to KalshiClient later is
+    refused too without anyone remembering to update this class.
+
+    This is what makes paper mode structurally safe. Paper reads prod books,
+    and prod is where real money lives; a client that merely promises not to
+    write is one bug away from writing.
+    """
+
+    WRITE_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
+
+    def request(self, method: str, route: str, **kwargs) -> dict:
+        if method.upper() in self.WRITE_METHODS:
+            raise ReadOnlyError(
+                f"ReadOnlyClient refused {method.upper()} {route}. This client "
+                f"exists so paper mode cannot trade against {self.creds.env}."
+            )
+        return super().request(method, route, **kwargs)
+
+    def create_order(self, *args, **kwargs):
+        raise ReadOnlyError("ReadOnlyClient cannot place orders")
+
+    def cancel_order(self, *args, **kwargs):
+        raise ReadOnlyError("ReadOnlyClient cannot cancel orders")
+
+
 def build_client(**kwargs) -> KalshiClient:
     """from_env() with a readable message instead of a traceback on misconfig."""
     try:
         return KalshiClient.from_env(**kwargs)
     except KalshiConfigError as exc:
         sys.exit(f"config error: {exc}")
+
+
+def build_readonly_prod_client(env_file: Path | str | None = DEFAULT_ENV_FILE,
+                               **kwargs) -> ReadOnlyClient:
+    """A ReadOnlyClient pointed at prod, for reading books in paper mode."""
+    try:
+        creds = load_readonly_prod_credentials(env_file)
+    except KalshiConfigError as exc:
+        sys.exit(f"config error: {exc}")
+    return ReadOnlyClient(creds, **kwargs)

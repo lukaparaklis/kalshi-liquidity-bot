@@ -53,8 +53,12 @@ from .economics import (
 POOLS_FILE = Path("pools.json")
 
 MARKET_PAGE_SIZE = 200
-MARKET_PAGES = 4
+SERIES_LIMIT = 40       # series probed, one /markets request each
 DEFAULT_PROBE = 30      # orderbook fetches, one request each
+
+# CLAUDE.md rejects fast series outright: the underlying trades faster on other
+# venues, so our quotes are stale and every fill is adversely selected.
+FAST_FREQUENCIES = frozenset({"fifteen_min", "hourly"})
 DEFAULT_SIZE = 100      # contracts rested per side
 DEFAULT_HOURS = 24.0
 
@@ -94,30 +98,93 @@ def _number(value) -> float:
         return 0.0
 
 
-def fetch_open_markets(client, pages: int = MARKET_PAGES) -> list[dict]:
-    """
-    Open markets across several pages.
+def is_mve(ticker: str) -> bool:
+    """MVE = multi-variate event: multi-leg combination markets."""
+    return str(ticker or "").upper().startswith("KXMVE")
 
-    MVE (multi-leg combination) markets are dropped. They dominate the first
-    page, are not directly orderable — POSTing one returns 404 market_not_found
-    — and would otherwise fill the entire shortlist.
+
+def select_series(series: list[dict], *, categories: set[str] | None = None,
+                  include_fast: bool = False, limit: int = SERIES_LIMIT) -> list[dict]:
     """
-    markets: list[dict] = []
-    cursor = None
-    for _ in range(pages):
-        params = {"status": "open", "limit": MARKET_PAGE_SIZE}
-        if cursor:
-            params["cursor"] = cursor
-        data = client.get("/markets", params=params)
-        markets += data.get("markets") or []
-        cursor = data.get("cursor") or ""
-        if not cursor:
+    Choose which series to look for markets in.
+
+    Two filters, for two different reasons:
+
+    MVE series are dropped because their markets are not directly orderable —
+    POSTing one returns 404 market_not_found. There are only 14 such series out
+    of ~13,000, but on prod they hold tens of thousands of open markets and
+    /markets returns them first, so a blind sweep sees nothing else.
+
+    Fast series (fifteen_min, hourly) are dropped because CLAUDE.md rejects
+    them on the merits: "the underlying trades faster on a hundred other
+    exchanges, so our quotes are always stale and every fill is adversely
+    selected. Target SLOW markets." Using the frequency field makes that a
+    property of discovery rather than a rule someone has to remember.
+    """
+    chosen = []
+    for entry in series:
+        ticker = entry.get("ticker")
+        if not ticker or is_mve(ticker):
+            continue
+        if not include_fast and entry.get("frequency") in FAST_FREQUENCIES:
+            continue
+        if categories and entry.get("category") not in categories:
+            continue
+        chosen.append(entry)
+        if len(chosen) >= limit:
             break
+    return chosen
 
+
+def fetch_open_markets(client, *, series_tickers: list[str] | None = None,
+                       categories: set[str] | None = None,
+                       series_limit: int = SERIES_LIMIT,
+                       include_fast: bool = False) -> list[dict]:
+    """
+    Open, directly-tradeable markets, discovered BY SERIES.
+
+    Paging /markets blindly does not work on prod. Two MVE series hold so many
+    open markets that 5,000 rows across 25 pages contained not one ordinary
+    market — the sweep never reaches them, at any page budget worth spending.
+    Demo hides this: it has few enough MVE markets that the first page or two
+    look normal.
+
+    So discovery goes through /series (one request, ~13k series, of which 14
+    are MVE) and then asks for each series' markets by name. Bounded by
+    series_limit, since that is one request per series.
+    """
+    if series_tickers:
+        chosen = [{"ticker": t} for t in series_tickers]
+        log(f"scanning {len(chosen)} explicitly requested series")
+    else:
+        all_series = client.get("/series").get("series") or []
+        chosen = select_series(all_series, categories=categories,
+                               include_fast=include_fast, limit=series_limit)
+        log(f"{len(all_series)} series available; probing {len(chosen)} "
+            f"(MVE and {'no ' if include_fast else ''}fast series excluded"
+            f"{', categories ' + ','.join(sorted(categories)) if categories else ''})")
+        if len(all_series) > series_limit:
+            log(f"NOTE: only the first {len(chosen)} matching series are probed. "
+                f"Use --series or --category to target deliberately.")
+
+    markets: list[dict] = []
+    for entry in chosen:
+        ticker = entry["ticker"]
+        try:
+            data = client.get("/markets", params={"series_ticker": ticker,
+                                                  "status": "open",
+                                                  "limit": MARKET_PAGE_SIZE})
+        except KalshiAPIError as exc:
+            log(f"  series {ticker}: {exc.status}")
+            continue
+        markets += data.get("markets") or []
+
+    # Belt and braces: drop MVE at the market level too, in case a series slips
+    # through under a name that does not start with KXMVE.
     tradeable = [m for m in markets
                  if m.get("ticker") and not m.get("mve_collection_ticker")]
-    log(f"{len(markets)} open markets, {len(markets) - len(tradeable)} MVE skipped, "
-        f"{len(tradeable)} tradeable")
+    log(f"{len(markets)} open markets found, {len(markets) - len(tradeable)} MVE "
+        f"dropped, {len(tradeable)} tradeable")
     return tradeable
 
 
@@ -180,12 +247,17 @@ class Scan:
 
 
 def scan_markets(client, *, my_size: int, hours: float, probe: int,
-                 target_size: int) -> list[Scan]:
+                 target_size: int, series_tickers: list[str] | None = None,
+                 categories: set[str] | None = None,
+                 series_limit: int = SERIES_LIMIT,
+                 include_fast: bool = False) -> list[Scan]:
     pools = load_pools()
     if not pools:
         log(f"no {POOLS_FILE} — ranking by reward share per dollar of fill risk")
 
-    markets = fetch_open_markets(client)
+    markets = fetch_open_markets(client, series_tickers=series_tickers,
+                                 categories=categories, series_limit=series_limit,
+                                 include_fast=include_fast)
     markets.sort(key=lambda m: _number(m.get("volume_24h_fp")) or _number(m.get("volume_fp")),
                  reverse=True)
 
@@ -255,7 +327,11 @@ def print_table(scans: list[Scan], target_size: int) -> None:
 def cmd_scan(client, args) -> int:
     print_assumptions(args.target_size)
     scans = scan_markets(client, my_size=args.size, hours=args.hours,
-                         probe=args.probe, target_size=args.target_size)
+                         probe=args.probe, target_size=args.target_size,
+                         series_tickers=args.series,
+                         categories=set(args.category) if args.category else None,
+                         series_limit=args.series_limit,
+                         include_fast=args.include_fast)
     if not scans:
         log("nothing to rank")
         return 1
@@ -299,6 +375,17 @@ def main() -> int:
     scan.add_argument("--hours", type=float, default=DEFAULT_HOURS)
     scan.add_argument("--probe", type=int, default=DEFAULT_PROBE,
                       help="how many books to fetch (one request each)")
+    scan.add_argument("--series", action="append",
+                      help="series ticker to scan, e.g. KXHIGHNY; repeatable. "
+                           "Bypasses discovery entirely.")
+    scan.add_argument("--category", action="append",
+                      help="restrict discovery to a category, e.g. "
+                           "'Climate and Weather'; repeatable")
+    scan.add_argument("--series-limit", type=int, default=SERIES_LIMIT,
+                      help=f"series to probe when discovering (default {SERIES_LIMIT})")
+    scan.add_argument("--include-fast", action="store_true",
+                      help="include fifteen_min/hourly series, which CLAUDE.md "
+                           "rejects as structurally adversely selected")
 
     detail = sub.add_parser("book", help="show one book and its Reference Price")
     detail.add_argument("ticker")
