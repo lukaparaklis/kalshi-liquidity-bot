@@ -36,6 +36,7 @@ from src.economics import (
     mid_cents,
     qualifying_depth,
     spread_cents,
+    total_depth,
     trade_fee_cents,
     trade_fee_dollars,
     two_sided_ok,
@@ -172,20 +173,41 @@ class TestFeeShape:
 # BOOK-DERIVED QUANTITIES
 # ---------------------------------------------------------------------------
 
-class TestQualifyingDepth:
-    def test_it_sums_the_side(self):
+class TestDepth:
+    """
+    Two different depths, and using the wrong one destroyed the ranking once.
+
+    qualifying_depth answers "does this market reach Target Size" and is capped
+    there, because depth beyond the threshold does not help meet it.
+    total_depth answers "how much am I sharing the reward with" and must never
+    be capped.
+    """
+
+    def test_qualifying_depth_sums_the_side(self):
         b = book(yes=[(60, 100), (59, 150)])
 
         assert qualifying_depth(b, "yes", TARGET) == 250
 
-    def test_it_caps_at_target_size(self):
-        """The program asks whether the market reaches Target Size, not by how much."""
+    def test_qualifying_depth_caps_at_target_size(self):
+        """The threshold test: reaching Target Size is what matters, not exceeding it."""
         b = book(yes=[(60, 50_000)])
 
         assert qualifying_depth(b, "yes", TARGET) == TARGET
 
-    def test_an_empty_side_qualifies_nothing(self):
+    def test_total_depth_is_not_capped(self):
+        """This is the competition, and all of it counts."""
+        b = book(yes=[(60, 50_000)])
+
+        assert total_depth(b, "yes") == 50_000
+
+    def test_total_depth_sums_every_level(self):
+        b = book(yes=[(60, 100), (59, 150), (58, 2_000)])
+
+        assert total_depth(b, "yes") == 2_250
+
+    def test_an_empty_side_has_no_depth_either_way(self):
         assert qualifying_depth(book(), "yes", TARGET) == 0
+        assert total_depth(book(), "yes") == 0
 
 
 class TestTwoSidedRequirement:
@@ -262,6 +284,32 @@ class TestRewardEstimate:
         large = estimate_reward(b, 500, TARGET).share
 
         assert large > small
+
+    def test_share_discriminates_between_books_past_target_size(self):
+        """
+        The regression that destroyed the ranking. Capping the denominator at
+        Target Size made every market with more than 1,000 resting return
+        exactly 100/(1000+100) = 9.1%, so 22,000 contracts of competition and
+        1,100 scored identically and the ordering collapsed onto pools.json.
+        """
+        busy = book(yes=[(60, 2_000)], no=[(38, 2_000)])
+        mobbed = book(yes=[(60, 20_000)], no=[(38, 20_000)])
+
+        busy_share = estimate_reward(busy, 100, TARGET).share
+        mobbed_share = estimate_reward(mobbed, 100, TARGET).share
+
+        assert busy_share > mobbed_share
+        assert busy_share == pytest.approx(100 / 2_100)
+        assert mobbed_share == pytest.approx(100 / 20_100)
+        assert busy_share != pytest.approx(100 / 1_100)   # the old capped answer
+
+    def test_share_keeps_falling_however_deep_the_book_gets(self):
+        """No plateau: there is no depth past which extra competition stops mattering."""
+        shares = [estimate_reward(book(yes=[(60, d)], no=[(38, d)]), 100, TARGET).share
+                  for d in (1_000, 5_000, 25_000, 100_000)]
+
+        assert shares == sorted(shares, reverse=True)
+        assert len(set(shares)) == 4
 
     def test_share_shrinks_as_competitors_arrive(self):
         """Rewards are a share of a fixed pool, so crowding is the main risk."""

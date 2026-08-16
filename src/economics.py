@@ -129,14 +129,28 @@ def assumptions(target_size: int) -> list[str]:
 # BOOK-DERIVED QUANTITIES
 # ---------------------------------------------------------------------------
 
+def total_depth(book: OrderBook, side: str) -> int:
+    """
+    All resting size on one side. UNCAPPED — this is the competition.
+
+    Use this wherever the question is "how much liquidity am I sharing the
+    reward with", which is every share calculation. Capping it destroys the
+    only signal that distinguishes a market with 1,100 contracts resting from
+    one with 22,000.
+    """
+    return sum(size for _, size in book.levels(side))
+
+
 def qualifying_depth(book: OrderBook, side: str, target_size: int) -> int:
     """
-    Resting size on one side that counts toward Target Size, capped at it.
+    Resting size counted toward the Target Size THRESHOLD, capped at it.
 
-    Capped because the program measures whether the market reaches Target Size,
-    not how far past it goes.
+    The cap belongs here and only here: the program asks whether the market
+    reaches Target Size, so depth beyond it does not help meet the requirement.
+    That makes this the right input to the two-sided snapshot test and the
+    wrong input to any share calculation — see total_depth.
     """
-    return min(sum(size for _, size in book.levels(side)), target_size)
+    return min(total_depth(book, side), target_size)
 
 
 def two_sided_ok(book: OrderBook, target_size: int) -> bool:
@@ -218,16 +232,27 @@ def estimate_reward(book: OrderBook, my_size: int, target_size: int,
     the snapshot total is 2.0 across all participants (1.0 per side), so our
     fraction of the whole is the mean of the two side shares.
 
-    Ported from reference/kalshi_liquidity_scanner.py with one deliberate
+    The denominator is TOTAL resting depth, not depth capped at Target Size.
+    The capped version was an outright bug: it put a capped denominator under
+    an uncapped numerator, so every market with more than Target Size resting
+    returned the identical share — 100/(1000+100) = 9.1% — whatever was really
+    on the book. Measured against prod, that overstated our share by 8x to 17x
+    and, worse, made the estimate blind: 22,000 contracts of competition and
+    1,100 scored the same, so the ranking collapsed onto whatever pool numbers
+    happened to be in pools.json.
+
+    Raw depth is still the conservative choice. Orders resting below the
+    Reference Price earn DiscountFactor ^ ticks_away, so the true
+    credit-weighted denominator is smaller than the raw sum and our real share
+    is at least this. Refining that needs the discount factor, which Kalshi
+    does not publish.
+
+    Ported from reference/kalshi_liquidity_scanner.py with one other deliberate
     divergence. The reference gave any market that failed the two-sided test a
     0.5 valid fraction, which on an EMPTY book produced a 100% share at half
     credit — ranking dead markets top, since owning all of nothing looks like
     owning everything. A market that cannot reach Target Size even with our
     size added earns nothing at all, so that case is now zero.
-
-    One inherited uncertainty worth naming: qualifying_depth caps existing
-    depth at Target Size but our own size is not capped, so on a market already
-    past Target Size this slightly overstates our share.
     """
     if two_sided_ok(book, target_size):
         valid_fraction = VALID_FRACTION_TWO_SIDED
@@ -238,7 +263,7 @@ def estimate_reward(book: OrderBook, my_size: int, target_size: int,
 
     share = 0.0
     for side in ("yes", "no"):
-        existing = qualifying_depth(book, side, target_size)
+        existing = total_depth(book, side)
         share += my_size / max(1.0, existing + my_size)
     share /= 2.0
 

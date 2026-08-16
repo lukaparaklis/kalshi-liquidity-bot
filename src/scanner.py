@@ -68,23 +68,68 @@ DEFAULT_HOURS = 24.0
 # ---------------------------------------------------------------------------
 
 def load_pools() -> dict[str, float]:
+    """
+    Read pools.json. Keys beginning with "_" are treated as comments, since the
+    file is hand-maintained from the incentives page and needs annotating.
+    """
     if not POOLS_FILE.exists():
         return {}
     try:
-        return {k: float(v) for k, v in json.loads(POOLS_FILE.read_text()).items()}
-    except (ValueError, TypeError) as exc:
+        raw = json.loads(POOLS_FILE.read_text())
+        return {k: float(v) for k, v in raw.items() if not k.startswith("_")}
+    except (ValueError, TypeError, AttributeError) as exc:
         log(f"{POOLS_FILE} is unreadable ({exc}); continuing without pools")
         return {}
 
 
-def match_pool(ticker: str, pools: dict[str, float]) -> float | None:
-    """Exact ticker first, then longest matching prefix."""
-    if ticker in pools:
-        return pools[ticker]
-    matches = [(k, v) for k, v in pools.items() if ticker.startswith(k)]
+def match_pool(event_ticker: str, pools: dict[str, float]) -> float | None:
+    """
+    The daily pool for an EVENT. Exact event ticker first, then longest prefix.
+
+    Prefixes matter because events expire — KXB200MS-27MAR is gone next April —
+    so a file of exact event tickers goes stale almost immediately. A prefix
+    like "KXB200" keeps working across rollovers; an exact entry pinned from the
+    incentives page beats it when both match.
+    """
+    if not event_ticker:
+        return None
+    if event_ticker in pools:
+        return pools[event_ticker]
+    matches = [(k, v) for k, v in pools.items() if event_ticker.startswith(k)]
     if not matches:
         return None
     return max(matches, key=lambda kv: len(kv[0]))[1]
+
+
+def count_markets_per_event(markets: list[dict]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for market in markets:
+        event = market.get("event_ticker")
+        if event:
+            counts[event] = counts.get(event, 0) + 1
+    return counts
+
+
+def pool_per_market(market: dict, pools: dict[str, float],
+                    markets_per_event: dict[str, int]) -> tuple[float | None, int]:
+    """
+    (pool share for this market, markets in its event).
+
+    The incentives page lists one figure per EVENT row, and an event holds every
+    strike in it — 1 to 33 of them here, averaging 10.5. Treating that figure as
+    per-market multiplies the implied programme by the number of strikes: these
+    five chip families alone came to $171,045/day, which is not a plausible
+    incentive budget. Splitting evenly across the event's markets is the
+    conservative reading. Kalshi may well weight it by activity instead, which
+    would favour the busier strikes within an event — worth checking before any
+    of these numbers are trusted.
+    """
+    event = market.get("event_ticker") or ""
+    pool = match_pool(event, pools)
+    count = markets_per_event.get(event, 1) or 1
+    if pool is None:
+        return None, count
+    return pool / count, count
 
 
 # ---------------------------------------------------------------------------
@@ -206,7 +251,10 @@ class Scan:
     target_size: int
     my_size: int
     hours: float
-    pool: float | None
+    pool: float | None            # this market's share of its event's pool
+    event_ticker: str = ""
+    event_pool: float | None = None
+    markets_in_event: int = 1
 
     def __post_init__(self):
         self.yes_ref = self.book.reference_price("yes", self.target_size)
@@ -258,6 +306,15 @@ def scan_markets(client, *, my_size: int, hours: float, probe: int,
     markets = fetch_open_markets(client, series_tickers=series_tickers,
                                  categories=categories, series_limit=series_limit,
                                  include_fast=include_fast)
+    # Counted over EVERY open market found, not just the ones probed: an
+    # event's pool is split across all its strikes, whether or not we look at
+    # them.
+    markets_per_event = count_markets_per_event(markets)
+    if pools:
+        log(f"{len(markets_per_event)} events; pools are per-event, split across "
+            f"each event's markets (mean "
+            f"{len(markets) / max(len(markets_per_event), 1):.1f} markets/event)")
+
     markets.sort(key=lambda m: _number(m.get("volume_24h_fp")) or _number(m.get("volume_fp")),
                  reverse=True)
 
@@ -270,9 +327,13 @@ def scan_markets(client, *, my_size: int, hours: float, probe: int,
             log(f"  {ticker}: orderbook unavailable ({exc.status})")
             continue
         volume = _number(market.get("volume_24h_fp")) or _number(market.get("volume_fp"))
+        share, count = pool_per_market(market, pools, markets_per_event)
+        event = market.get("event_ticker") or ""
         scans.append(Scan(ticker=ticker, volume=volume, book=book,
                           target_size=target_size, my_size=my_size, hours=hours,
-                          pool=match_pool(ticker, pools)))
+                          pool=share, event_ticker=event,
+                          event_pool=match_pool(event, pools),
+                          markets_in_event=count))
 
     scans.sort(key=lambda s: s.rank_key, reverse=True)
     return scans
@@ -291,9 +352,9 @@ def print_assumptions(target_size: int) -> None:
 
 
 def print_table(scans: list[Scan], target_size: int) -> None:
-    header = (f"  {'ticker':<40} {'vol24':>9} {'ref_y':>5} {'ref_n':>5} "
-              f"{'qual_y':>7} {'qual_n':>7} {'2sd':>3} {'share':>6} {'vld':>5} "
-              f"{'rwd/d':>7} {'fill/d':>7} {'net/d':>7} {'cap$':>8}")
+    header = (f"  {'ticker':<38} {'vol24':>8} {'ref_y':>5} {'ref_n':>5} "
+              f"{'2sd':>3} {'share':>6} {'vld':>5} {'mkts':>5} {'pool/mkt':>9} "
+              f"{'rwd/d':>7} {'fill/d':>7} {'net/d':>7}")
     print(header)
     print("  " + "-" * (len(header) - 2))
 
@@ -301,24 +362,35 @@ def print_table(scans: list[Scan], target_size: int) -> None:
         reward = scan.reward.dollars_per_day
         net = scan.net_dollars
         print(
-            f"  {scan.ticker[:40]:<40} {scan.volume:>9.0f} "
+            f"  {scan.ticker[:38]:<38} {scan.volume:>8.0f} "
             f"{(scan.yes_ref.price if scan.yes_ref else '-'):>5} "
             f"{(scan.no_ref.price if scan.no_ref else '-'):>5} "
-            f"{scan.yes_depth:>7} {scan.no_depth:>7} "
             f"{('Y' if scan.two_sided else 'n'):>3} "
-            f"{scan.reward.share * 100:>5.1f}% "
+            f"{scan.reward.share * 100:>5.2f}% "
             f"{scan.reward.valid_fraction:>5.2f} "
-            f"{(f'{reward:.2f}' if reward is not None else '-'):>7} "
+            f"{scan.markets_in_event:>5} "
+            f"{(f'{scan.pool:.3f}' if scan.pool is not None else '-'):>9} "
+            f"{(f'{reward:.3f}' if reward is not None else '-'):>7} "
             f"{scan.fill_cost:>7.2f} "
-            f"{(f'{net:.2f}' if net is not None else '-'):>7} "
-            f"{scan.capital:>8.2f}"
+            f"{(f'{net:+.3f}' if net is not None else '-'):>7}"
         )
 
     quotable = sum(1 for s in scans if s.quotable)
     two_sided = sum(1 for s in scans if s.two_sided)
+    priced = [s for s in scans if s.net_dollars is not None]
+    positive = [s for s in priced if s.net_dollars > 0]
     print()
     log(f"{quotable}/{len(scans)} markets have a Reference Price on both sides; "
         f"{two_sided} would produce a qualifying snapshot at Target Size {target_size}")
+    if priced:
+        best = max(priced, key=lambda s: s.net_dollars)
+        log(f"NET POSITIVE: {len(positive)}/{len(priced)} markets with a known pool")
+        log(f"best: {best.ticker} at {best.net_dollars:+.3f}/day "
+            f"(reward {best.reward.dollars_per_day:.3f} - fill {best.fill_cost:.2f})")
+        total = sum(s.net_dollars for s in positive)
+        log(f"sum of every net-positive market: {total:+.2f}/day across "
+            f"{len(positive)} markets, needing "
+            f"${sum(s.capital for s in positive):,.0f} of capital")
     if quotable == 0 and scans:
         log("None are quotable at this Target Size. If the real Target Size is "
             "lower, more would qualify — which is exactly why the assumption matters.")
