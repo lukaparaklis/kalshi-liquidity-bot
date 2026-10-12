@@ -43,10 +43,13 @@ from .book import OrderBook
 from .economics import (
     TARGET_SIZE_ASSUMPTION,
     assumptions,
+    capital_at_reference_dollars,
     capital_required_dollars,
+    cost_per_pair_cents,
     estimate_fill_cost_dollars,
     estimate_reward,
     qualifying_depth,
+    size_for_budget,
     spread_cents,
     two_sided_ok,
 )
@@ -67,6 +70,12 @@ DEFAULT_PROBE = 30      # orderbook fetches, one request each
 FAST_FREQUENCIES = frozenset({"fifteen_min", "hourly"})
 DEFAULT_SIZE = 100      # contracts rested per side
 DEFAULT_HOURS = 24.0
+
+# A pair of Reference Prices summing this far below $1 means our quotes would
+# rest nowhere near the market. See Scan.suspect: at that distance the reward
+# estimate depends on there being no proximity rule in the program, which is an
+# assumption this project has no evidence for.
+SUSPECT_REF_SPREAD_CENTS = 25
 
 
 # ---------------------------------------------------------------------------
@@ -137,6 +146,35 @@ def match_pool(event_ticker: str, pools: dict[str, float]) -> float | None:
     if not matches:
         return None
     return max(matches, key=lambda kv: len(kv[0]))[1]
+
+
+def event_of_market(market_ticker: str) -> str:
+    """
+    The event a market belongs to: KXH200WS-26SEP18-3.000 -> KXH200WS-26SEP18.
+
+    Market tickers are EVENT-STRIKE, so one rsplit recovers the event without a
+    round trip. That matters for filtering an explicit --ticker list: the
+    alternative is a /markets call per ticker purely to read back a field the
+    ticker already contains.
+    """
+    return str(market_ticker or "").rsplit("-", 1)[0]
+
+
+def pooled_only(market_tickers: list[str],
+                pools: dict[str, float] | None = None) -> tuple[list[str], list[str]]:
+    """
+    Split tickers into (pool-bearing, not). Order is preserved.
+
+    Returns both halves rather than filtering silently. A dropped ticker is
+    always worth a log line — the caller asked for that market by name, and
+    "nothing happened" is the least useful way to say it has no pool.
+    """
+    pools = load_pools() if pools is None else pools
+    kept, dropped = [], []
+    for ticker in market_tickers:
+        target = kept if match_pool(event_of_market(ticker), pools) is not None else dropped
+        target.append(ticker)
+    return kept, dropped
 
 
 def series_of_event(event_ticker: str) -> str:
@@ -325,10 +363,18 @@ class Scan:
     event_pool: float | None = None
     markets_in_event: int = 1
     liquidity: str = ""           # the incentives page's Low/Medium/High
+    budget: float | None = None   # when set, my_size is DERIVED from it
 
     def __post_init__(self):
         self.yes_ref = self.book.reference_price("yes", self.target_size)
         self.no_ref = self.book.reference_price("no", self.target_size)
+        # Budget mode inverts the usual relationship: instead of asking what a
+        # fixed 100 contracts earn here, ask how many contracts a fixed dollar
+        # amount buys and what THAT earns. Cheap and expensive strikes cost the
+        # same per pair, so the size barely moves between markets — but the
+        # share it wins moves by an order of magnitude, which is the point.
+        if self.budget is not None:
+            self.my_size = size_for_budget(self.book, self.budget, self.target_size)
         self.yes_depth = qualifying_depth(self.book, "yes", self.target_size)
         self.no_depth = qualifying_depth(self.book, "no", self.target_size)
         self.two_sided = two_sided_ok(self.book, self.target_size)
@@ -337,7 +383,12 @@ class Scan:
                                       self.pool)
         self.fill_cost = estimate_fill_cost_dollars(
             self.book, self.my_size, self.hours, self.volume)
-        self.capital = capital_required_dollars(self.book, self.my_size)
+        # At the Reference Price when there is one — that is where we rest.
+        # Falls back to best-bid capital only so unquotable markets still show
+        # a number rather than a zero that reads like "free".
+        self.capital = (capital_at_reference_dollars(self.book, self.my_size,
+                                                     self.target_size)
+                        or capital_required_dollars(self.book, self.my_size))
 
     @property
     def quotable(self) -> bool:
@@ -374,21 +425,118 @@ class Scan:
         return self.reward.dollars_per_day - self.fill_cost
 
     @property
+    def pair_cost_cents(self) -> int | None:
+        return cost_per_pair_cents(self.book, self.target_size)
+
+    @property
+    def ref_spread_cents(self) -> int | None:
+        """
+        How far the two Reference Prices sit from summing to a dollar.
+
+        A yes at P and a no at Q that BOTH fill pay out exactly $1, so a pair
+        costing 37c would be 63c of riskless profit. No such trade exists: the
+        gap is the market pricing the certainty that both legs will never fill.
+        It is therefore a direct, book-derived measure of how far off-market our
+        quotes would rest — 0c means quoting the touch, 98c means quoting into
+        the void.
+        """
+        pair = self.pair_cost_cents
+        return None if pair is None else 100 - pair
+
+    @property
+    def suspect(self) -> bool:
+        """
+        Whether this market's ranking depends on a rule we are not sure exists.
+
+        These books are all the same shape: a handful of contracts at a real
+        price and a 1,000-lot wall at 1c, nothing between. Our reading of the
+        program — walk down from the best bid to 1/5 of Target Size — puts the
+        Reference Price on the 1c wall, so resting 10,000 contracts at 1c for
+        $200 claims 90% of the pool at almost no fill risk.
+
+        If that were true it would be free money, and it would not still be
+        sitting there. The likeliest explanation is that the program has a
+        proximity or maximum-spread qualification that CLAUDE.md's rule list is
+        missing, and these markets are where the gap shows up. They are ranked
+        and marked rather than dropped: the point is to make the hole visible,
+        because it also caps how much any number in this table can be trusted.
+        """
+        spread = self.ref_spread_cents
+        return spread is not None and spread >= SUSPECT_REF_SPREAD_CENTS
+
+    @property
+    def reward_per_capital(self) -> float | None:
+        """
+        Daily reward dollars per dollar of collateral — the return on capital,
+        which is what a fixed budget actually has to choose between.
+
+        Ranking by dollars per MARKET answers a question nobody with a budget
+        is asking. Two markets paying $0.40/day are not equivalent if one needs
+        $200 of collateral and the other $2,000; the first is a 0.2%/day return
+        and the second 0.02%. Because reward is a share, the thin book wins
+        twice over: the same dollars buy the same contracts, and those contracts
+        face less competition for the pool.
+        """
+        if self.reward.dollars_per_day is None or self.capital <= 0:
+            return None
+        return self.reward.dollars_per_day / self.capital
+
+    @property
+    def net_per_capital(self) -> float | None:
+        """Same rate after modelled fill cost. The one that has to clear zero."""
+        if self.net_dollars is None or self.capital <= 0:
+            return None
+        return self.net_dollars / self.capital
+
+    @property
     def rank_key(self) -> float:
-        """Net dollars when the pool is known, else share per dollar of fill risk."""
+        """
+        Return on capital when the pool is known, else share per dollar of fill
+        risk.
+
+        Deliberately NOT pool_per_depth, which the previous version used. That
+        measured the market's own reward density and was blind to how much
+        capital it takes to claim a slice of it — a $1,000 pool on a deep book
+        outranked a $100 pool on a thin one even when the second returned more
+        per dollar committed.
+        """
         if not self.quotable:
             return float("-inf")
-        if self.pool_per_depth is not None:
-            return self.pool_per_depth
+        if self.reward_per_capital is not None:
+            return self.reward_per_capital
         return self.reward.share / (self.fill_cost + 0.01)
+
+    def sort_key(self, rank_by: str = "roc") -> float:
+        """
+        `roc` ranks on gross reward per capital dollar; `net-roc` subtracts the
+        modelled fill cost first; `net` is the old dollars-per-market ordering,
+        kept so the two views can be compared rather than argued about.
+
+        They disagree, and the disagreement is the finding: gross return on
+        capital is maximised by resting large size deep in a sparse book, which
+        is also where the fill-cost model charges most. Neither ordering is
+        authoritative — one rests on a pool number scraped off a web page, the
+        other on the most uncertain estimate in the project.
+        """
+        if not self.quotable:
+            return float("-inf")
+        if rank_by == "net-roc":
+            value = self.net_per_capital
+        elif rank_by == "net":
+            value = self.net_dollars
+        else:
+            return self.rank_key
+        return value if value is not None else float("-inf")
 
 
 def scan_markets(client, *, my_size: int, hours: float, probe: int,
-                 target_size: int, series_tickers: list[str] | None = None,
+                 target_size: int, budget: float | None = None,
+                 series_tickers: list[str] | None = None,
                  categories: set[str] | None = None,
                  series_limit: int = SERIES_LIMIT,
                  include_fast: bool = False,
-                 from_pools: bool = False) -> list[Scan]:
+                 from_pools: bool = False,
+                 rank_by: str = "roc") -> list[Scan]:
     pools = load_pools()
     ratings = load_liquidity()
     if not pools:
@@ -425,8 +573,18 @@ def scan_markets(client, *, my_size: int, hours: float, probe: int,
             f"each event's markets (mean "
             f"{len(markets) / max(len(markets_per_event), 1):.1f} markets/event)")
 
+    # Probe order matters, because `probe` truncates. Sorting by volume and
+    # taking the top N is the right sample when ranking by dollars per market —
+    # and precisely the wrong one when ranking by return on capital, since the
+    # busiest markets are the deep, crowded ones the new metric is meant to rank
+    # DOWN. A budget-mode scan that only ever looks at the top 60 by volume
+    # cannot find a thin book by construction.
     markets.sort(key=lambda m: _number(m.get("volume_24h_fp")) or _number(m.get("volume_fp")),
                  reverse=True)
+    if budget is not None and probe < len(markets):
+        log(f"NOTE: probing {probe} of {len(markets)} markets, chosen by volume. "
+            f"Budget ranking favours THIN books, which are the low-volume ones "
+            f"this sample cuts first — pass --probe {len(markets)} to see them all.")
 
     scans: list[Scan] = []
     for market in markets[:probe]:
@@ -444,9 +602,10 @@ def scan_markets(client, *, my_size: int, hours: float, probe: int,
                           pool=share, event_ticker=event,
                           event_pool=match_pool(event, pools),
                           markets_in_event=count,
-                          liquidity=ratings.get(event, "")))
+                          liquidity=ratings.get(event, ""),
+                          budget=budget))
 
-    scans.sort(key=lambda s: s.rank_key, reverse=True)
+    scans.sort(key=lambda s: s.sort_key(rank_by), reverse=True)
     return scans
 
 
@@ -462,30 +621,46 @@ def print_assumptions(target_size: int) -> None:
     print()
 
 
-def print_table(scans: list[Scan], target_size: int) -> None:
-    header = (f"  {'ticker':<34} {'liq':>6} {'depth':>9} {'pool/mkt':>9} "
-              f"{'$/1k depth':>11} {'ref_y':>5} {'ref_n':>5} {'2sd':>3} "
-              f"{'share':>6} {'rwd/d':>7} {'fill/d':>7} {'net/d':>7}")
+def print_table(scans: list[Scan], target_size: int, limit: int | None = None) -> None:
+    header = (f"  {'#':>2} {'ticker':<30} {'existing':>8} {'size':>5} "
+              f"{'capital':>8} {'share':>6} {'pool/mkt':>8} {'rwd/d':>7} "
+              f"{'fill/d':>7} {'net/d':>7} {'rwd/$/d':>8} {'off':>4} {'2sd':>3}")
     print(header)
     print("  " + "-" * (len(header) - 2))
 
-    for scan in scans:
+    shown = scans if limit is None else scans[:limit]
+    for rank, scan in enumerate(shown, start=1):
         reward = scan.reward.dollars_per_day
         net = scan.net_dollars
-        density = scan.pool_per_depth
+        roc = scan.reward_per_capital
+        off = scan.ref_spread_cents
         print(
-            f"  {scan.ticker[:34]:<34} {(scan.liquidity or '-'):>6} "
-            f"{scan.total_depth:>9,} "
-            f"{(f'{scan.pool:.3f}' if scan.pool is not None else '-'):>9} "
-            f"{(f'{density * 1000:.3f}' if density is not None else '-'):>11} "
-            f"{(scan.yes_ref.price if scan.yes_ref else '-'):>5} "
-            f"{(scan.no_ref.price if scan.no_ref else '-'):>5} "
-            f"{('Y' if scan.two_sided else 'n'):>3} "
-            f"{scan.reward.share * 100:>5.2f}% "
+            f"  {rank:>2}{'!' if scan.suspect else ' '}{scan.ticker[:30]:<30}"
+            f"{scan.total_depth:>8,} "
+            f"{scan.my_size:>5} "
+            f"{scan.capital:>8,.0f} "
+            f"{scan.reward.share * 100:>5.1f}% "
+            f"{(f'{scan.pool:.2f}' if scan.pool is not None else '-'):>8} "
             f"{(f'{reward:.3f}' if reward is not None else '-'):>7} "
             f"{scan.fill_cost:>7.2f} "
-            f"{(f'{net:+.3f}' if net is not None else '-'):>7}"
+            f"{(f'{net:+.3f}' if net is not None else '-'):>7} "
+            f"{(f'{roc * 100:.3f}%' if roc is not None else '-'):>8} "
+            f"{(f'{off}c' if off is not None else '-'):>4} "
+            f"{('Y' if scan.two_sided else 'n'):>3}"
         )
+
+    if limit is not None and len(scans) > limit:
+        print(f"  ... {len(scans) - limit} more not shown")
+
+    suspects = [s for s in shown if s.suspect]
+    if suspects:
+        print()
+        log(f"! {len(suspects)}/{len(shown)} rows rest their Reference Price "
+            f">= {SUSPECT_REF_SPREAD_CENTS}c away from a $1 pair ('off' column). "
+            f"Their reward depends on the program having NO proximity or "
+            f"maximum-spread qualification. CLAUDE.md's rule list does not "
+            f"mention one; that is not evidence there isn't one. Verify at "
+            f"help.kalshi.com before sizing into these.")
 
     quotable = sum(1 for s in scans if s.quotable)
     two_sided = sum(1 for s in scans if s.two_sided)
@@ -521,17 +696,27 @@ def cmd_scan(client, args) -> int:
             args.from_pools = True
             log("targeting the events in pools.json (--all-series to scan "
                 "discovered series instead)")
+    if args.budget:
+        log(f"budget mode: ${args.budget:,.0f} of collateral per market; size is "
+            f"derived per book, ranking is daily reward per dollar of capital")
     scans = scan_markets(client, my_size=args.size, hours=args.hours,
                          probe=args.probe, target_size=args.target_size,
+                         budget=args.budget,
                          series_tickers=args.series,
                          categories=set(args.category) if args.category else None,
                          series_limit=args.series_limit,
                          include_fast=args.include_fast,
-                         from_pools=args.from_pools)
+                         from_pools=args.from_pools,
+                         rank_by=args.rank)
+    if args.exclude_suspect:
+        kept = [s for s in scans if not s.suspect]
+        log(f"excluding {len(scans) - len(kept)} market(s) whose Reference "
+            f"Prices rest >= {SUSPECT_REF_SPREAD_CENTS}c off a $1 pair")
+        scans = kept
     if not scans:
         log("nothing to rank")
         return 1
-    print_table(scans, args.target_size)
+    print_table(scans, args.target_size, limit=args.top)
     return 0
 
 
@@ -570,7 +755,23 @@ def main() -> int:
 
     scan = sub.add_parser("scan", help="rank markets by reward vs fill risk")
     scan.add_argument("--size", type=int, default=DEFAULT_SIZE,
-                      help="contracts rested per side")
+                      help="contracts rested per side; ignored when --budget is set")
+    scan.add_argument("--budget", type=float, default=None,
+                      help="collateral in dollars to commit to ONE market. Size "
+                           "is then derived per book and the ranking becomes "
+                           "daily reward per dollar of capital, which is what a "
+                           "fixed budget actually chooses between.")
+    scan.add_argument("--top", type=int, default=None,
+                      help="show only the top N rows")
+    scan.add_argument("--exclude-suspect", action="store_true",
+                      help=f"drop markets whose Reference Prices rest >= "
+                           f"{SUSPECT_REF_SPREAD_CENTS}c off a $1 pair — the "
+                           f"dead 1c-wall books whose reward depends on the "
+                           f"program having no proximity rule")
+    scan.add_argument("--rank", choices=("roc", "net-roc", "net"), default="roc",
+                      help="roc: daily reward per dollar of capital (default). "
+                           "net-roc: same, after modelled fill cost. "
+                           "net: dollars per market, the old ordering.")
     scan.add_argument("--hours", type=float, default=DEFAULT_HOURS)
     scan.add_argument("--probe", type=int, default=DEFAULT_PROBE,
                       help="how many books to fetch (one request each)")

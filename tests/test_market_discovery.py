@@ -21,7 +21,8 @@ from __future__ import annotations
 
 import pytest
 
-from src.scanner import FAST_FREQUENCIES, SERIES_LIMIT, is_mve, select_series
+from src.scanner import (FAST_FREQUENCIES, SERIES_LIMIT, event_of_market,
+                         is_mve, pooled_only, select_series)
 
 
 def series(ticker, *, category="Economics", frequency="daily") -> dict:
@@ -136,3 +137,62 @@ class TestSeriesSelection:
 
     def test_the_default_limit_is_a_bounded_request_budget(self):
         assert SERIES_LIMIT <= 100
+
+
+class TestEventOfMarket:
+    """
+    Recovering the event from a market ticker, for --pools-only filtering.
+
+    Worth pinning because the alternative implementation — a /markets call per
+    ticker to read event_ticker back — is what this avoids, and a wrong split
+    would silently drop every ticker as unpooled.
+    """
+
+    @pytest.mark.parametrize("market,event", [
+        ("KXH200WS-26SEP18-3.000", "KXH200WS-26SEP18"),
+        ("KXB200WS-26AUG21-6.500", "KXB200WS-26AUG21"),
+        ("KXA100WS-26SEP04-1.000", "KXA100WS-26SEP04"),
+    ])
+    def test_the_strike_is_stripped(self, market, event):
+        assert event_of_market(market) == event
+
+    def test_an_event_ticker_is_not_mangled_beyond_recognition(self):
+        # Passing an event where a market was expected should not silently
+        # produce something that still matches a prefix pool entry.
+        assert event_of_market("KXH200WS-26SEP18") == "KXH200WS"
+
+    def test_a_missing_ticker_is_empty(self):
+        assert event_of_market("") == ""
+        assert event_of_market(None) == ""
+
+
+class TestPooledOnly:
+    POOLS = {"KXH200WS-26SEP18": 165.0, "KXB200WS-26AUG21": 195.0}
+
+    def test_pooled_tickers_are_kept_and_others_dropped(self):
+        kept, dropped = pooled_only(
+            ["KXH200WS-26SEP18-3.000", "KXHIGHNY-26AUG17-T80",
+             "KXB200WS-26AUG21-6.500"],
+            self.POOLS)
+        assert kept == ["KXH200WS-26SEP18-3.000", "KXB200WS-26AUG21-6.500"]
+        assert dropped == ["KXHIGHNY-26AUG17-T80"]
+
+    def test_order_is_preserved(self):
+        tickers = [f"KXH200WS-26SEP18-{n}.000" for n in range(5)]
+        kept, _ = pooled_only(tickers, self.POOLS)
+        assert kept == tickers
+
+    def test_a_prefix_pool_entry_still_matches(self):
+        # match_pool falls back to longest prefix, so a bare series prefix keeps
+        # working across event rollovers.
+        kept, dropped = pooled_only(["KXB200WS-27MAR06-4.000"], {"KXB200WS": 195.0})
+        assert kept == ["KXB200WS-27MAR06-4.000"]
+        assert dropped == []
+
+    def test_no_pools_drops_everything(self):
+        kept, dropped = pooled_only(["KXH200WS-26SEP18-3.000"], {})
+        assert kept == []
+        assert dropped == ["KXH200WS-26SEP18-3.000"]
+
+    def test_an_empty_list_is_not_an_error(self):
+        assert pooled_only([], self.POOLS) == ([], [])

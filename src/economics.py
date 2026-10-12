@@ -311,3 +311,67 @@ def capital_required_dollars(book: OrderBook, my_size: int) -> float:
     if not book.yes or not book.no:
         return 0.0
     return my_size * (book.yes[0][0] + book.no[0][0]) / 100.0
+
+
+# ---------------------------------------------------------------------------
+# CAPITAL EFFICIENCY
+# ---------------------------------------------------------------------------
+#
+# The ranking question is not "which market pays the most" but "where does the
+# NEXT dollar of collateral earn most". Those differ sharply, because reward is
+# a SHARE: my_size / (my_size + existing_depth). The same 200 contracts take 40%
+# of the pool on a book with 300 resting and 6% on a book with 3,000. Ranking by
+# dollars per market hides that entirely — it rewards big pools regardless of
+# how many people are already splitting them.
+#
+# The counterweight is the two-sided Target Size gate, and it bites exactly the
+# books this favours: a snapshot is excluded unless BOTH sides reach Target Size
+# market-wide. A thin book is capital-efficient precisely because few others are
+# there, which is also why it may never qualify. estimate_reward already returns
+# a zero valid_fraction for that case; the per-dollar view makes the collision
+# visible instead of burying it in a rate.
+
+
+def cost_per_pair_cents(book: OrderBook, target_size: int) -> int | None:
+    """
+    Collateral in cents for one yes+no pair rested AT the Reference Price.
+
+    Resting is fully collateralised on Kalshi: a yes bid at P ties up P, a no
+    bid at Q ties up Q, so a pair costs P+Q — a little under $1, since the two
+    reference prices sit inside the spread rather than summing to 100.
+
+    Prices are the REFERENCE prices, not the best bids, because that is where
+    this bot actually rests (CLAUDE.md, "The core mechanic"). Using best bids
+    would overstate the capital and understate every per-dollar rate.
+    """
+    yes_ref = book.reference_price("yes", target_size)
+    no_ref = book.reference_price("no", target_size)
+    if yes_ref is None or no_ref is None:
+        return None
+    return yes_ref.price + no_ref.price
+
+
+def size_for_budget(book: OrderBook, budget_dollars: float,
+                    target_size: int) -> int:
+    """
+    Contracts per side affordable with `budget_dollars`, resting both sides.
+
+    Budget is the binding constraint on a small account, so size is an OUTPUT of
+    the market, not a fixed input. A 4c/96c market costs the same $1 per pair as
+    a 50c/50c one, so cheap strikes do NOT buy more contracts — the two legs
+    always sum to roughly a dollar. What varies between markets is not the price
+    of a pair but how much existing depth that pair has to share the pool with.
+    """
+    pair = cost_per_pair_cents(book, target_size)
+    if not pair or pair <= 0 or budget_dollars <= 0:
+        return 0
+    return int(budget_dollars * 100 // pair)
+
+
+def capital_at_reference_dollars(book: OrderBook, my_size: int,
+                                 target_size: int) -> float:
+    """Collateral for resting my_size per side at the Reference Price."""
+    pair = cost_per_pair_cents(book, target_size)
+    if pair is None:
+        return 0.0
+    return my_size * pair / 100.0

@@ -57,6 +57,11 @@ DEFAULT_SIZE = 100
 DEFAULT_INTERVAL_S = 10.0
 REQUOTE_THRESHOLD_TICKS = 1
 
+# One orderbook request each, spent once at startup. The pooled universe is
+# ~400 markets today, so this ranks all of them rather than a volume-ordered
+# slice of them.
+POOLED_PROBE_LIMIT = 500
+
 
 @dataclass(frozen=True)
 class IntendedQuote:
@@ -278,6 +283,11 @@ def main() -> int:
     parser.add_argument("--top", type=int,
                         help="instead of --ticker, quote the top N markets the "
                              "scanner ranks on prod")
+    parser.add_argument("--pools-only", action="store_true",
+                        help="restrict to events listed in pools.json. Without "
+                             "it, --top scans whatever series discovery returns, "
+                             "which is mostly markets with no reward pool at all. "
+                             "Also filters an explicit --ticker list.")
     parser.add_argument("--size", type=int, default=DEFAULT_SIZE)
     parser.add_argument("--target-size", type=int, default=TARGET_SIZE_ASSUMPTION,
                         help="ASSUMED; Kalshi does not publish it per market")
@@ -291,16 +301,47 @@ def main() -> int:
     client = build_readonly_prod_client()
 
     tickers = args.tickers or []
+
+    if tickers and args.pools_only:
+        from .scanner import pooled_only
+        tickers, dropped = pooled_only(tickers)
+        if dropped:
+            log(f"--pools-only: dropping {len(dropped)} ticker(s) whose event has "
+                f"no pool in pools.json: {', '.join(dropped)}")
+
     if args.top:
         from .scanner import scan_markets
+
+        # from_pools is the whole fix. scan_markets does NOT infer it — that
+        # logic lives in scanner's cmd_scan, which this path never touches — so
+        # every --top run so far ranked whatever series discovery happened to
+        # return. Pools loaded, were used to price markets that had none, and
+        # the quoter papered unrelated series while looking like it had chosen
+        # them deliberately.
+        # Probe budget. Discovery is unbounded, so it stays sampled; the pooled
+        # universe is a few hundred markets and gets ranked whole. That matters
+        # because the sample is ordered by volume while the ranking favours thin
+        # books — taking the top 30 by volume and then ranking on capital
+        # efficiency selects against the very markets the metric is looking for.
+        probe = POOLED_PROBE_LIMIT if args.pools_only else max(args.top * 3, 30)
         ranked = scan_markets(client, my_size=args.size, hours=24.0,
-                              probe=max(args.top * 3, 30),
-                              target_size=args.target_size)
-        tickers = [s.ticker for s in ranked if s.quotable][:args.top]
+                              probe=probe,
+                              target_size=args.target_size,
+                              from_pools=args.pools_only)
+        candidates = [s for s in ranked if s.quotable]
+        if args.pools_only:
+            # Ranked on reward per dollar of capital, so a market whose pool is
+            # unknown has no rate to rank on and would sort in on the fallback.
+            candidates = [s for s in candidates if s.reward.dollars_per_day is not None]
+        tickers = [s.ticker for s in candidates][:args.top]
         if not tickers:
             log("scanner found no quotable market at this Target Size; "
                 "nothing to paper-trade")
             return 1
+        if not args.pools_only:
+            log("NOTE: --top ranked discovered series, most of which carry no "
+                "reward pool. Pass --pools-only to rank only pool-bearing events.")
+
     if not tickers:
         parser.error("pass --ticker TICKER (repeatable) or --top N")
 
