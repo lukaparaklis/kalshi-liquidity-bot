@@ -99,7 +99,7 @@ Tested on Python 3.14.
 ```bash
 python -m venv .venv
 source .venv/bin/activate
-pip install requests cryptography pytest
+pip install -r requirements.txt
 pytest
 ```
 
